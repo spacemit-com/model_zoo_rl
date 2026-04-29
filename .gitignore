@@ -1,0 +1,33 @@
+# --- 编译产物 ---
+build/
+install/
+bin/
+lib/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+
+# --- Python 缓存 ---
+__pycache__/
+*.py[cod]
+*$py.class
+dist/
+*.egg-info/
+venv/
+.venv/
+
+# --- 模型与大数据 ---
+*.onnx
+*.gguf
+*.weights
+*.bin
+*.tar.gz
+*.zip
+
+# --- IDE 与系统 ---
+.vscode/
+.idea/
+.DS_Store
+*.swp
