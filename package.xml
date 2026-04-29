@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>rl</name>
+  <maintainer email="robot_team@spacemit.com">robot_team</maintainer>
+  <version>0.1.0</version>
+  <description>RL policy executor service: ONNX-based inference with segment-wise observation assembly</description>
+  <system_depend check="pkg-config --exists eigen3">libeigen3-dev</system_depend>
+  <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
+
+  <export>
+    <build_type>cmake</build_type>
+  </export>
+</package>
