@@ -40,7 +40,7 @@ find_library(ONNXRUNTIME_LIB
 if(NOT ONNXRUNTIME_INCLUDE_DIR OR NOT ONNXRUNTIME_LIB)
     message(FATAL_ERROR
         "ONNX Runtime not found.\n"
-        "  apt install (rv64): sudo apt install libonnxruntime-dev\n"
+        "  apt install (rv64): sudo apt install spacemit-onnxruntime\n"
         "  或手动指定: cmake .. -DONNXRUNTIME_DIR=/path/to/onnxruntime")
 endif()
 
