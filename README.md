@@ -26,16 +26,19 @@ RL 策略推理执行器，负责 YAML 配置解析、观测组装、ONNX 推理
 ```bash
 # 系统依赖
 sudo apt install -y libeigen3-dev libyaml-cpp-dev cmake g++
-
-# ONNX Runtime 1.21.0（仅需 x86_64 本机 RL 推理时安装）
-wget https://github.com/microsoft/onnxruntime/releases/download/v1.21.0/onnxruntime-linux-x64-1.21.0.tgz
-tar -xzf onnxruntime-linux-x64-1.21.0.tgz
-sudo cp -r onnxruntime-linux-x64-1.21.0/include/* /usr/local/include/
-sudo cp -r onnxruntime-linux-x64-1.21.0/lib/* /usr/local/lib/
-sudo ldconfig
 ```
 
-> CMake 查找顺序：`ONNXRUNTIME_DIR` 环境变量或编译参数 → `/usr/local` → `/usr`。若安装到非默认路径，可通过 `export ONNXRUNTIME_DIR=/path/to/onnxruntime` 或编译时 `-DONNXRUNTIME_DIR=/path/to/onnxruntime` 指定。其他版本（≥ 1.17）见 [github.com/microsoft/onnxruntime/releases](https://github.com/microsoft/onnxruntime/releases)。
+ONNX Runtime 由 CMake 处理。CMake 按以下顺序查找，命中即用：
+
+1. `-DONNXRUNTIME_DIR=...` 编译参数
+2. 环境变量 `ONNXRUNTIME_DIR`
+3. 系统路径 `/usr/local`、`/usr`
+4. 缓存路径 `~/.cache/thirdparty/onnxruntime/onnxruntime-linux-x64-1.21.0/`
+5. 上述均未命中：从官方 release 拉取 `onnxruntime-linux-x64-1.21.0.tgz` 解压到第 4 项缓存路径
+
+> 离线/受限网络环境可设 `SROBOTIS_THIRDPARTY_FETCH_OFF=ON` 禁用第 5 步拉取，并通过
+> `export ONNXRUNTIME_DIR=/path/to/onnxruntime` 指向预先下载好的目录。其他版本（≥ 1.17）见
+> [github.com/microsoft/onnxruntime/releases](https://github.com/microsoft/onnxruntime/releases)。
 
 **K3 板卡端**：
 

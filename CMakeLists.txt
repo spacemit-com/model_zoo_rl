@@ -72,6 +72,16 @@ install(FILES include/rl_service.h
     DESTINATION include
 )
 
+# 当 onnxruntime 来自非系统路径（如 ~/.cache/thirdparty fetch 来的），把 .so
+# 一并装到 staging/lib，让下游 RPATH=$ORIGIN/../lib 可解析；rv64 apt 装的
+# spacemit-onnxruntime 在 /usr，由系统 ldconfig 接管，跳过避免冗余
+get_filename_component(_ort_lib_dir "${ONNXRUNTIME_LIB}" DIRECTORY)
+if(NOT _ort_lib_dir MATCHES "^/usr")
+    file(GLOB _ort_so_files "${_ort_lib_dir}/libonnxruntime.so*")
+    install(FILES ${_ort_so_files} DESTINATION lib)
+    message(STATUS "  installing onnxruntime libs to staging: ${_ort_lib_dir}")
+endif()
+
 # ============================================================================
 # 示例
 # ============================================================================
