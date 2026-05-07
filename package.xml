@@ -6,7 +6,7 @@
   <description>RL policy executor service: ONNX-based inference with segment-wise observation assembly</description>
   <system_depend check="pkg-config --exists eigen3">libeigen3-dev</system_depend>
   <system_depend check="pkg-config --exists yaml-cpp">libyaml-cpp-dev</system_depend>
-  <system_depend check="uname -m | grep -vq riscv64 || dpkg -s spacemit-onnxruntime">spacemit-onnxruntime</system_depend>
+  <system_depend arch="riscv64">spacemit-onnxruntime</system_depend>
 
   <export>
     <build_type>cmake</build_type>
