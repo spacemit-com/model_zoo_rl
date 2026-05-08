@@ -114,7 +114,7 @@ class ModelAnalyzer:
 
         # 尝试常见维度组合
         if self.num_inputs == 1:
-            common_dims = [750, 512, 256, 128, 64, 47, 45, 39, 37, 1024, 2048, 4373]
+            common_dims = [750, 512, 256, 128, 96, 64, 47, 45, 39, 37, 1024, 2048, 4373]
 
             for dim in common_dims:
                 try:

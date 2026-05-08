@@ -109,6 +109,8 @@ struct LoadedPolicyConfig {
     int infer_decimation = 4;
     double max_roll = 0.7;
     double max_pitch = 0.7;
+    std::vector<double> kp;  // 策略训练时对应的 PD 刚度，为空表示未配置
+    std::vector<double> kd;  // 策略训练时对应的 PD 阻尼，为空表示未配置
 };
 
 /**

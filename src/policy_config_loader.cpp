@@ -163,6 +163,13 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
         out.exec_cfg.motion_length = policy["motion_length"].as<double>();
     }
 
+    if (policy["kp"] && policy["kp"].IsSequence()) {
+        out.kp = policy["kp"].as<std::vector<double>>();
+    }
+    if (policy["kd"] && policy["kd"].IsSequence()) {
+        out.kd = policy["kd"].as<std::vector<double>>();
+    }
+
     return out;
 }
 

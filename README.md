@@ -158,9 +158,9 @@ run_benchmark_policy.sh tiangong walk               # 其他机型/策略
 **`LoadedPolicyConfig`** — YAML 解析结果：
 - `exec_cfg` — PolicyExecutorConfig
 - `command_init` — 初始速度指令 [vx, vy, wz]
+- `kp / kd` — 该策略训练时的 PD 增益（每策略独立，进入 RL 后下发给驱动）
 - `infer_decimation` — 推理降频参数
 - `max_roll / max_pitch` — 安全约束
-- `thread_cpu_id / thread_priority` — 线程配置
 
 **`ObsSegmentConfig`** — 观测段配置：
 - `terms` — 观测项列表（如 base_gyro、joint_pos、phase）
