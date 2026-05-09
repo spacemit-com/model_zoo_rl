@@ -47,8 +47,8 @@ int main(int argc, char *argv[]) {
         // LoadedPolicyConfig 包含：
         //   exec_cfg        → PolicyExecutorConfig（模型、观测、动作映射等）
         //   command_init    → 初始速度指令 [vx, vy, wz]
+        //   kp, kd          → 该策略训练时的 PD 增益（每策略独立，进入 RL 后下发给驱动）
         //   infer_decimation, max_roll, max_pitch → behavior_manager 使用
-        //   thread_cpu_id, thread_priority        → behavior_manager 使用
 
         // ---- 2. 初始化执行器 ----
         std::cout << "[test] 初始化 PolicyExecutor\n";
