@@ -124,6 +124,23 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
         }
     }
 
+    // 读取 custom array dims（泛型 N 维 obs term 维度声明）
+    // 例：
+    //   custom_array_dims:
+    //     motion_command: 58
+    //     motion_anchor_pos_b: 3
+    //     motion_anchor_ori_b: 6
+    const auto array_dims = policy["custom_array_dims"];
+    if (array_dims && array_dims.IsMap()) {
+        for (const auto &kv : array_dims) {
+            const auto name = kv.first.as<std::string>();
+            const int dim = kv.second.as<int>();
+            if (dim > 0) {
+                out.exec_cfg.custom_array_dims[name] = dim;
+            }
+        }
+    }
+
     if (out.exec_cfg.obs_segments.empty()) {
         throw std::runtime_error("[PolicyConfigLoader] 策略 '" + policy_name +
                                 "' 缺少 observation.segments 配置");

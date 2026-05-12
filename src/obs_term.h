@@ -68,6 +68,12 @@ public:
     void SetCustomScalar(const std::string &name, float value);
     float GetCustomScalar(const std::string &name) const;
 
+    /// 注册自定义数组维度（Init 阶段调用），让 TermDim 在 push 前就知道 N 维 term 的维度
+    void RegisterCustomArrayDim(const std::string &name, int dim);
+
+    /// 推入自定义数组当前值（每帧 AssembleObs 前调用），FillTermValues 时按 name 查表 memcpy
+    void SetCustomArray(const std::string &name, const float *data, int size);
+
     /// 推进相位时间
     void AdvancePhase(float dt);
 
@@ -84,6 +90,8 @@ private:
     int action_dim_ = 0;
     float phase_time_ = 0.0f;
     std::unordered_map<std::string, float> custom_scalars_;
+    std::unordered_map<std::string, int> custom_array_dims_;
+    std::unordered_map<std::string, std::vector<float>> custom_arrays_;
 };
 
 }  // namespace rl_policy

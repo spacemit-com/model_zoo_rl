@@ -16,8 +16,11 @@
  *   policy_name 和 robot_dir 均需单独传入，模拟调用方行为。
  *   生产场景中这两个参数由上层调用方解析后传入。
  *
- * 示例:
- *   ./test_policy_executor ../../../application/config/g1.yaml motion ../../../application/robot/g1
+ * 示例（在 spacemit_robot 仓库根目录执行）:
+ *   ./output/staging/bin/test_policy_executor \
+ *       application/native/humanoid_unitree_g1/config/g1.yaml \
+ *       motion \
+ *       application/native/humanoid_unitree_g1/
  */
 
 #include <iostream>
@@ -32,9 +35,11 @@ using rl_policy::PolicyExecutor;
 int main(int argc, char *argv[]) {
     if (argc < 4) {
         std::cerr << "用法: " << argv[0] << " <yaml配置文件> <policy_name> <robot_dir>\n";
-        std::cerr << "示例:\n";
+        std::cerr << "示例（在 spacemit_robot 仓库根目录执行）:\n";
         std::cerr << "  " << argv[0]
-                << " ../../../application/config/g1.yaml motion ../../../application/robot/g1\n";
+                << " application/native/humanoid_unitree_g1/config/g1.yaml"
+                << " motion"
+                << " application/native/humanoid_unitree_g1/\n";
         return 1;
     }
 

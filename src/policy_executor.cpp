@@ -142,6 +142,12 @@ float PolicyExecutor::GetCustomScalar(const std::string &name) const {
     return impl_->term_calc.GetCustomScalar(name);
 }
 
+// ---- 自定义数组（泛型 N 维 obs term 注入通道）----
+
+void PolicyExecutor::SetCustomArray(const std::string &name, const float *data, int size) {
+    impl_->term_calc.SetCustomArray(name, data, size);
+}
+
 // ============================================================
 // init
 // ============================================================
@@ -241,6 +247,11 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     // 初始化自定义标量
     for (const auto &kv : cfg.custom_scalar_defaults) {
         impl_->term_calc.SetCustomScalar(kv.first, kv.second);
+    }
+
+    // 注册自定义数组维度（泛型 N 维 obs term，必须在 segment 构建前注册以便 TermDim 正确返回）
+    for (const auto &kv : cfg.custom_array_dims) {
+        impl_->term_calc.RegisterCustomArrayDim(kv.first, kv.second);
     }
 
     // ---- 为每段创建 assembler ----

@@ -142,6 +142,7 @@ run_benchmark_policy.sh tiangong walk               # 其他机型/策略
 | `HasLstm` | `void → bool` | 模型是否包含 LSTM 单元（影响推理循环方式） |
 | `HasObsHist` | `void → bool` | 是否使用 obs_hist 输入（长期观测历史） |
 | `SetCustomScalar / GetCustomScalar` | `const std::string &name, float value` | 设置/获取自定义标量（如 `"z"` 相位、`"stand_flag"` 标志） |
+| `SetCustomArray` | `const std::string &name, const float *data, int size` | 推入 N 维自定义数组 obs term（泛型扩展点）。配套 yaml `custom_array_dims: {name: dim}` 声明维度。例：BeyondMimic tracking 通过 `SetCustomArray("motion_command", buf, 58)` 把 npz 当前帧参考关节注入 obs，rl 层不感知业务概念 |
 | `AssembleObs` | 传感器数据 → `Eigen::VectorXf &out_obs` | 组装观测向量：计算各段、交给对应处理器、拼接输出 |
 | `Infer` | `const Eigen::VectorXf &obs` → `std::vector<double> &action` | 执行推理：MLP / LSTM / obs_hist 均自动处理 |
 | `MapActionToTargetPos` | `const std::vector<double> &action` → `std::vector<double> &target_pos` | 将策略动作映射为全身关节目标位置 |
