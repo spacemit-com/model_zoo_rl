@@ -95,6 +95,10 @@ struct PolicyExecutorConfig {
     // ---- 自定义标量默认值 ----
     std::unordered_map<std::string, float> custom_scalar_defaults;
 
+    // ---- 自定义数组维度声明（泛型扩展点，N 维 obs term 通过 SetCustomArray 注入）----
+    // 例：tracking 策略声明 {"motion_command":58,"motion_anchor_pos_b":3,"motion_anchor_ori_b":6}
+    std::unordered_map<std::string, int> custom_array_dims;
+
     // ---- 维度校验 ----
     bool strict_obs_dim_check = false;
 };
@@ -168,6 +172,21 @@ public:
     /** 设置自定义标量（如 "z", "stand_flag"），需在 AssembleObs 前调用 */
     void SetCustomScalar(const std::string &name, float value);
     float GetCustomScalar(const std::string &name) const;
+
+    /**
+     * @brief 推入自定义 N 维数组 obs term（泛型扩展点）
+     *
+     * 用于上层（如 tracking 状态）每帧把外部计算好的多维数据 push 进 obs。
+     * 维度需在 PolicyExecutorConfig.custom_array_dims 中先声明（Init 时已注册）。
+     *
+     * 例：tracking 策略每帧调用：
+     *   policy.SetCustomArray("motion_command", motion_buf_58, 58);
+     *   policy.SetCustomArray("motion_anchor_pos_b", anchor_pos_3, 3);
+     *   policy.SetCustomArray("motion_anchor_ori_b", anchor_ori_6, 6);
+     *
+     * 需在 AssembleObs 前调用。
+     */
+    void SetCustomArray(const std::string &name, const float *data, int size);
 
     /**
      * @brief 组装观测向量

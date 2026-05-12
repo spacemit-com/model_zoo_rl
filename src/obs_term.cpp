@@ -67,6 +67,10 @@ int ObsTermCalculator::TermDim(const std::string &term) const {
         return 6;
     if (term == "ref_motion_phase")
         return 1;
+    // 自定义数组（由上层通过 RegisterCustomArrayDim 注册维度）
+    auto it_arr = custom_array_dims_.find(term);
+    if (it_arr != custom_array_dims_.end())
+        return it_arr->second;
     // 自定义标量
     return 1;
 }
@@ -220,6 +224,13 @@ void ObsTermCalculator::FillTermValues(const std::string &term,
         return;
     }
 
+    // 自定义数组：上层 push 进来的 N 维数据，直接 memcpy
+    auto it_arr = custom_arrays_.find(term);
+    if (it_arr != custom_arrays_.end()) {
+        std::copy(it_arr->second.begin(), it_arr->second.end(), out);
+        return;
+    }
+
     // 自定义标量
     auto it = custom_scalars_.find(term);
     out[0] = (it != custom_scalars_.end()) ? it->second : 0.0f;
@@ -236,6 +247,25 @@ void ObsTermCalculator::SetCustomScalar(const std::string &name, float value) {
 float ObsTermCalculator::GetCustomScalar(const std::string &name) const {
     auto it = custom_scalars_.find(name);
     return (it != custom_scalars_.end()) ? it->second : 0.0f;
+}
+
+void ObsTermCalculator::RegisterCustomArrayDim(const std::string &name, int dim) {
+    custom_array_dims_[name] = dim;
+    // 预先 resize buffer，避免 SetCustomArray 第一次调用时分配
+    custom_arrays_[name].assign(dim, 0.0f);
+}
+
+void ObsTermCalculator::SetCustomArray(const std::string &name, const float *data, int size) {
+    auto it_dim = custom_array_dims_.find(name);
+    if (it_dim == custom_array_dims_.end()) {
+        // 未注册维度，按 size 自动建立（容忍调用方未显式 register 的场景）
+        custom_array_dims_[name] = size;
+    } else if (it_dim->second != size) {
+        // 维度不匹配 → 不写入（容错，避免 buffer overflow）
+        return;
+    }
+    auto &buf = custom_arrays_[name];
+    buf.assign(data, data + size);
 }
 
 void ObsTermCalculator::AdvancePhase(float dt) {
