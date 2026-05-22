@@ -171,57 +171,51 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     }
     impl_->onnx.PrintModelInfo();
 
-    const int input_count = impl_->onnx.GetInputCount();
-    const int output_count = impl_->onnx.GetOutputCount();
+    impl_->obs_dim = static_cast<int>(impl_->onnx.GetInputInfo(0).total_size);
+    impl_->action_dim = static_cast<int>(impl_->onnx.GetOutputInfo(0).total_size);
+    impl_->has_lstm = false;
+    impl_->has_obs_hist = false;
 
-    if (input_count == 1 && output_count == 1) {
-        impl_->has_lstm = false;
-        impl_->has_obs_hist = false;
-        impl_->obs_dim = static_cast<int>(impl_->onnx.GetInputInfo(0).total_size);
-        impl_->action_dim = static_cast<int>(impl_->onnx.GetOutputInfo(0).total_size);
-        std::cout << "[PolicyExecutor] MLP 模型: obs_dim=" << impl_->obs_dim
-                << ", action_dim=" << impl_->action_dim << std::endl;
-
-    } else if (input_count == 2 && output_count == 1) {
-        impl_->has_lstm = false;
-        impl_->has_obs_hist = true;
-        impl_->obs_dim = static_cast<int>(impl_->onnx.GetInputInfo(0).total_size);
-        impl_->action_dim = static_cast<int>(impl_->onnx.GetOutputInfo(0).total_size);
-        const auto &hist_info = impl_->onnx.GetInputInfo(1);
-        if (hist_info.shape.size() == 3 && hist_info.shape[0] == 1) {
-            impl_->obs_hist_len = static_cast<int>(hist_info.shape[1]);
-            const int hist_obs_dim = static_cast<int>(hist_info.shape[2]);
-            if (hist_obs_dim != impl_->obs_dim) {
-                throw std::runtime_error("[PolicyExecutor] 历史观测维度不匹配: obs_dim=" +
-                                        std::to_string(impl_->obs_dim) +
-                                        ", obs_hist[2]=" + std::to_string(hist_obs_dim));
-            }
-        } else {
-            throw std::runtime_error("[PolicyExecutor] 历史观测输入形状错误");
+    auto has_input = [&](const std::string &name) -> int {
+        for (int i = 0; i < impl_->onnx.GetInputCount(); ++i) {
+            if (impl_->onnx.GetInputInfo(i).name == name) return i;
         }
-        impl_->obs_hist.clear();
-        impl_->obs_hist.resize(impl_->obs_hist_len, Eigen::VectorXf::Zero(impl_->obs_dim));
-        std::cout << "[PolicyExecutor] 带历史观测模型: obs_dim=" << impl_->obs_dim
-                << ", action_dim=" << impl_->action_dim
-                << ", obs_hist_len=" << impl_->obs_hist_len << std::endl;
+        return -1;
+    };
 
-    } else if (input_count == 3 && output_count == 3) {
+    int h_idx = has_input("h_in");
+    int c_idx = has_input("c_in");
+    if (h_idx >= 0 && c_idx >= 0) {
         impl_->has_lstm = true;
-        impl_->has_obs_hist = false;
-        impl_->obs_dim = static_cast<int>(impl_->onnx.GetInputInfo(0).total_size);
-        impl_->action_dim = static_cast<int>(impl_->onnx.GetOutputInfo(0).total_size);
-        const int h_dim = static_cast<int>(impl_->onnx.GetInputInfo(1).total_size);
-        const int c_dim = static_cast<int>(impl_->onnx.GetInputInfo(2).total_size);
+        const int h_dim = static_cast<int>(impl_->onnx.GetInputInfo(h_idx).total_size);
+        const int c_dim = static_cast<int>(impl_->onnx.GetInputInfo(c_idx).total_size);
         impl_->h_state.setZero(h_dim);
         impl_->c_state.setZero(c_dim);
         std::cout << "[PolicyExecutor] LSTM 模型: obs_dim=" << impl_->obs_dim
                 << ", action_dim=" << impl_->action_dim << ", h_dim=" << h_dim
                 << ", c_dim=" << c_dim << std::endl;
+    }
 
-    } else {
-        throw std::runtime_error(
-            "[PolicyExecutor] 不支持的模型类型: " + std::to_string(input_count) + " 输入, " +
-            std::to_string(output_count) + " 输出");
+    if (!impl_->has_lstm && impl_->onnx.GetInputCount() >= 2) {
+        const auto &second = impl_->onnx.GetInputInfo(1);
+        if (second.shape.size() == 3 && second.shape[0] == 1 &&
+            static_cast<int>(second.shape[2]) == impl_->obs_dim) {
+            impl_->has_obs_hist = true;
+            impl_->obs_hist_len = static_cast<int>(second.shape[1]);
+            impl_->obs_hist.clear();
+            impl_->obs_hist.resize(
+                impl_->obs_hist_len, Eigen::VectorXf::Zero(impl_->obs_dim));
+            std::cout << "[PolicyExecutor] 带历史观测模型: obs_dim=" << impl_->obs_dim
+                    << ", action_dim=" << impl_->action_dim
+                    << ", obs_hist_len=" << impl_->obs_hist_len << std::endl;
+        }
+    }
+
+    if (!impl_->has_lstm && !impl_->has_obs_hist) {
+        std::cout << "[PolicyExecutor] MLP 模型: obs_dim=" << impl_->obs_dim
+                << ", action_dim=" << impl_->action_dim
+                << " (" << impl_->onnx.GetInputCount() << " 输入, "
+                << impl_->onnx.GetOutputCount() << " 输出)" << std::endl;
     }
 
     // 所有模型类型都需要初始化内部动作缓冲
