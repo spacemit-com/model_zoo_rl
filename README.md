@@ -70,6 +70,7 @@ mm
 - 测试程序：`output/staging/bin/test_policy_executor`、`output/staging/bin/test_onnx_infer`
 - 基准工具：`output/staging/bin/benchmark_policy_executor`、`output/staging/bin/benchmark_onnx_infer`
 - 基准脚本：`output/staging/bin/run_benchmark_policy.sh`、`output/staging/bin/run_benchmark_onnx.sh`
+- 辅助脚本：`scripts/extract_packed_motion.py` — 从包装版 ONNX 提取 motion 数据为 npz（依赖系统 Python 的 onnx + numpy）
 
 **独立 cmake 编译**：
 
@@ -136,13 +137,13 @@ run_benchmark_policy.sh tiangong walk               # 其他机型/策略
 
 | 接口名称 | 参数 / 返回 | 功能说明 |
 | :--- | :--- | :--- |
-| `Init` | `const PolicyExecutorConfig &cfg` | 初始化执行器：加载 ONNX 模型、初始化观测处理、验证维度 |
+| `Init` | `const PolicyExecutorConfig &cfg` | 初始化执行器：加载 ONNX 模型（按名称自动识别 MLP/LSTM/obs_hist，多余输入输出自动忽略）、初始化观测处理、验证维度 |
 | `ObsDim` | `void → int` | 返回预期观测向量维度 |
 | `ActionDim` | `void → int` | 返回动作向量维度 |
 | `HasLstm` | `void → bool` | 模型是否包含 LSTM 单元（影响推理循环方式） |
 | `HasObsHist` | `void → bool` | 是否使用 obs_hist 输入（长期观测历史） |
 | `SetCustomScalar / GetCustomScalar` | `const std::string &name, float value` | 设置/获取自定义标量（如 `"z"` 相位、`"stand_flag"` 标志） |
-| `SetCustomArray` | `const std::string &name, const float *data, int size` | 推入 N 维自定义数组 obs term（泛型扩展点）。配套 yaml `custom_array_dims: {name: dim}` 声明维度。例：BeyondMimic tracking 通过 `SetCustomArray("motion_command", buf, 58)` 把 npz 当前帧参考关节注入 obs，rl 层不感知业务概念 |
+| `SetCustomArray` | `const std::string &name, const float *data, int size` | 推入 N 维自定义数组 obs term（泛型扩展点）。配套 yaml `custom_array_dims: {name: dim}` 声明维度。例：tracking 策略通过 `SetCustomArray("motion_command", buf, 58)` 注入参考关节数据 |
 | `AssembleObs` | 传感器数据 → `Eigen::VectorXf &out_obs` | 组装观测向量：计算各段、交给对应处理器、拼接输出 |
 | `Infer` | `const Eigen::VectorXf &obs` → `std::vector<double> &action` | 执行推理：MLP / LSTM / obs_hist 均自动处理 |
 | `MapActionToTargetPos` | `const std::vector<double> &action` → `std::vector<double> &target_pos` | 将策略动作映射为全身关节目标位置 |
