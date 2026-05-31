@@ -120,6 +120,18 @@ run_benchmark_policy.sh tiangong walk               # 其他机型/策略
 
 输出指标（Avg / Std / P50 / P95 / P99 / Max / Miss）含义见详细使用章节。
 
+### CI 测试
+
+模块自带 `test.yaml`（CI 用例清单）+ `tests/`，经 SDK 根目录的 `robot-test` 运行：
+
+```bash
+scripts/test/robot-test list components/model_zoo/rl
+scripts/test/robot-test run  components/model_zoo/rl --scope pr        # 配置加载/错误路径（不依赖模型）
+scripts/test/robot-test run  components/model_zoo/rl --scope scheduled # 真模型推理冒烟（需已下载 policy）
+```
+
+仓库内无 onnx 模型，故 PR 档只验配置/错误处理；推理冒烟归 scheduled。
+
 ## 详细使用
 
 ### 接口说明

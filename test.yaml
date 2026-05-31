@@ -1,0 +1,30 @@
+module: components/model_zoo/rl
+
+# 说明：rl 仓库内不含 onnx 模型（按需下载，源码 .gitignore），故 PR 档只验
+# 配置加载/策略选择/错误处理（不需要模型）；真模型推理冒烟放 scheduled。
+
+tests:
+  - name: rl-config-error-path
+    description: >
+      PolicyExecutor 配置加载与策略选择的错误处理：缺参、坏 yaml、不存在的策略名，
+      均须经 LoadPolicyConfigFromYaml 校验后快速失败（非 0、不 hang）。无需模型。
+    category: functional
+    scopes: [pr]
+    timeout_s: 90
+    requires:
+      commands: [test_policy_executor]
+    command: |
+      bash tests/error_path.sh
+
+  - name: rl-inference-smoke
+    description: >
+      真模型推理冒烟：加载一个已下载的 policy，跑若干帧 obs 组装 + Infer + 动作映射，
+      断言 obs/action/joint 维度与模型一致。依赖模型，故归 scheduled（在有模型的环境跑）。
+    category: functional
+    scopes: [scheduled]
+    timeout_s: 300
+    workdir: sdk
+    requires:
+      commands: [test_policy_executor]
+    command: |
+      bash components/model_zoo/rl/tests/inference_smoke.sh
