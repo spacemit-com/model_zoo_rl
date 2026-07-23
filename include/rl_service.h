@@ -8,7 +8,7 @@
  * rl_service 是 rl 模块的对外统一接口：
  *   - 模型加载（内部委托推理后端，当前支持 ONNX Runtime）
  *   - 段式观测组装（通过可插拔的 ObsSegmentAssembler 策略）
- *   - 推理执行（MLP / LSTM / obs_hist）
+ *   - 声明式模型 I/O 绑定与推理执行
  *   - 动作映射
  *
  * 观测组装基于「段拼接」模型：
@@ -23,12 +23,83 @@
 
 #include <Eigen/Dense>
 #include <array>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
 namespace rl_policy {
+
+/** @brief 模型张量元素类型 */
+enum class TensorElementType : int {
+    UNDEFINED = 0,
+    FLOAT32 = 1,
+    UINT8 = 2,
+    INT8 = 3,
+    UINT16 = 4,
+    INT16 = 5,
+    INT32 = 6,
+    INT64 = 7,
+    STRING = 8,
+    BOOL = 9,
+    FLOAT16 = 10,
+    FLOAT64 = 11,
+    UINT32 = 12,
+    UINT64 = 13,
+    COMPLEX64 = 14,
+    COMPLEX128 = 15,
+    BFLOAT16 = 16,
+    FLOAT8E4M3FN = 17,
+    FLOAT8E4M3FNUZ = 18,
+    FLOAT8E5M2 = 19,
+    FLOAT8E5M2FNUZ = 20,
+    UINT4 = 21,
+    INT4 = 22,
+};
+
+/** @brief 非持有的原生模型张量视图 */
+struct TensorView {
+    TensorElementType element_type = TensorElementType::UNDEFINED;
+    const void *data = nullptr;
+    std::size_t element_count = 0;
+    std::size_t byte_count = 0;
+};
+
+template <typename T>
+struct TensorElementTypeOf;
+
+#define RL_DEFINE_TENSOR_TYPE(cpp_type, tensor_type) \
+    template <>                                       \
+    struct TensorElementTypeOf<cpp_type> {            \
+        static constexpr TensorElementType value = TensorElementType::tensor_type; \
+    }
+
+RL_DEFINE_TENSOR_TYPE(float, FLOAT32);
+RL_DEFINE_TENSOR_TYPE(double, FLOAT64);
+RL_DEFINE_TENSOR_TYPE(std::uint8_t, UINT8);
+RL_DEFINE_TENSOR_TYPE(std::int8_t, INT8);
+RL_DEFINE_TENSOR_TYPE(std::uint16_t, UINT16);
+RL_DEFINE_TENSOR_TYPE(std::int16_t, INT16);
+RL_DEFINE_TENSOR_TYPE(std::uint32_t, UINT32);
+RL_DEFINE_TENSOR_TYPE(std::int32_t, INT32);
+RL_DEFINE_TENSOR_TYPE(std::uint64_t, UINT64);
+RL_DEFINE_TENSOR_TYPE(std::int64_t, INT64);
+RL_DEFINE_TENSOR_TYPE(bool, BOOL);
+
+#undef RL_DEFINE_TENSOR_TYPE
+
+/** @brief 为普通 C++ 标量数组构造原生张量视图 */
+template <typename T>
+TensorView MakeTensorView(const T *data, std::size_t element_count) {
+    return {
+        TensorElementTypeOf<T>::value,
+        data,
+        element_count,
+        element_count * sizeof(T),
+    };
+}
 
 // ============================================================
 // 观测段配置
@@ -58,6 +129,51 @@ struct ObsSegmentConfig {
     bool include_current = true;         ///< 是否在读取前先写入当前帧
 };
 
+/** @brief ONNX 输入张量的数据来源 */
+enum class ModelInputSource {
+    OBSERVATION,          ///< 从 AssembleObs 生成的观测向量取一段
+    OBSERVATION_HISTORY,  ///< 自动维护指定输入张量的历史窗口
+    FEEDBACK,             ///< 上一帧输出反馈到下一帧输入
+    CONSTANT,             ///< 固定值
+    EXTERNAL,             ///< 上层通过 SetModelInput 注入
+};
+
+/** @brief ONNX 输出张量的处理方式 */
+enum class ModelOutputTarget {
+    ACTION,  ///< 策略动作
+    EXPOSE,  ///< 通过 GetModelOutput 暴露给上层
+    IGNORE,  ///< 明确忽略
+};
+
+/** @brief 单个 ONNX 输入张量的声明式绑定 */
+struct ModelInputBindingConfig {
+    std::string name;  ///< ONNX 输入张量名
+    ModelInputSource source = ModelInputSource::EXTERNAL;
+    std::string key;              ///< EXTERNAL 输入的上层键名，空则使用 name
+    std::string feedback_output;  ///< FEEDBACK 对应的 ONNX 输出张量名
+    std::string history_source;   ///< HISTORY 跟踪的 OBSERVATION 输入张量名
+    int observation_offset = -1;  ///< OBSERVATION 在完整观测中的起始位置，-1 自动顺排
+    std::vector<float> initial_value;  ///< CONSTANT 值或 EXTERNAL/FEEDBACK 初始值
+};
+
+/** @brief 单个 ONNX 输出张量的声明式绑定 */
+struct ModelOutputBindingConfig {
+    std::string name;  ///< ONNX 输出张量名
+    ModelOutputTarget target = ModelOutputTarget::EXPOSE;
+    std::string key;  ///< EXPOSE 的上层键名，空则使用 name
+};
+
+/**
+ * @brief 模型 I/O 拓扑配置
+ *
+ * 每个 ONNX 输入必须有唯一来源，每个输出必须声明用途或被 feedback 引用；
+ * 输出可同时作为 action/expose 和 feedback 源。
+ */
+struct ModelIOConfig {
+    std::vector<ModelInputBindingConfig> inputs;
+    std::vector<ModelOutputBindingConfig> outputs;
+};
+
 // ============================================================
 // 策略执行器配置（YAML 驱动）
 // ============================================================
@@ -69,6 +185,13 @@ struct PolicyExecutorConfig {
     double action_blend_ratio = 1.0;
     std::vector<double> rl_default_pos;
     std::vector<int> action_joint_index;
+
+    // ---- 模型 I/O 拓扑 ----
+    ModelIOConfig model_io;
+
+    // ---- 可选的数值裁剪（空=禁用，单值=全维，或逐维配置）----
+    std::vector<double> clip_observations;
+    std::vector<double> clip_actions;
 
     // ---- 段式观测配置（必须） ----
     std::vector<ObsSegmentConfig> obs_segments;
@@ -160,10 +283,10 @@ public:
     /** @return 动作向量维度 */
     int ActionDim() const;
 
-    /** @return 是否为 LSTM 模型 */
-    bool HasLstm() const;
+    /** @return 自动反馈状态张量对数量 */
+    int FeedbackStateCount() const;
 
-    /** @return 是否使用 obs_hist 输入 */
+    /** @return 是否使用 observation_history 输入 */
     bool HasObsHist() const;
 
     /** @brief 打印模型信息 */
@@ -189,6 +312,31 @@ public:
     void SetCustomArray(const std::string &name, const float *data, int size);
 
     /**
+     * @brief 设置 model_io 中 source=external 的输入张量
+     * @param key 绑定配置的 key；未配置 key 时使用 ONNX 张量名
+     */
+    void SetModelInput(const std::string &key, const float *data, int size);
+
+    /**
+     * @brief 使用与模型声明一致的原生 dtype 设置 external 输入
+     * @param key 绑定配置的 key；未配置 key 时使用 ONNX 张量名
+     * @param input 非持有 typed view，数据在调用期间保持有效即可
+     */
+    void SetModelInput(const std::string &key, const TensorView &input);
+
+    /**
+     * @brief 读取 model_io 中 target=expose 的最近一次输出
+     * @throws std::runtime_error key 不存在或尚未完成推理
+     */
+    const std::vector<float> &GetModelOutput(const std::string &key) const;
+
+    /**
+     * @brief 读取 expose 输出的原生 typed view
+     * @note view 指向内部缓冲区，有效期至下一次 Infer
+     */
+    TensorView GetModelOutputTensor(const std::string &key) const;
+
+    /**
      * @brief 组装观测向量
      *
      * 按 segments 配置顺序：计算每段当前帧 → 交给对应 assembler → 拼接输出
@@ -205,7 +353,7 @@ public:
                     float dt,
                     Eigen::VectorXf &out_obs);
 
-    /** 执行推理（MLP / LSTM / obs_hist 均自动处理） */
+    /** 按 model_io 绑定执行推理 */
     void Infer(const Eigen::VectorXf &obs, std::vector<double> &out_action);
 
     /** 将策略动作映射为全身关节目标位置 */

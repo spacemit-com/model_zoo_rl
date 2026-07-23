@@ -6,7 +6,7 @@
  * @brief OnnxRuntimeClass 推理测试（临时测试，不依赖 policy_executor）
  *
  * 用法：
- *   单模型测试:  ./test_onnx_infer <model.onnx> [--random]
+ *   单模型测试:  ./test_onnx_infer <model.onnx> [--random] [--iterations N]
  *   批量扫描:    ./test_onnx_infer --scan <robot_dir>
  *               ./test_onnx_infer --scan   (默认扫描 ../../../application/robot)
  */
@@ -27,6 +27,7 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -93,13 +94,15 @@ static ModelResult test_model(const std::string &model_path, bool use_random) {
     for (int i = 0; i < r.input_count; ++i) {
         const auto &info = ort.GetInputInfo(i);
         r.input_shapes.push_back(info.name + shape_str(info));
-        auto &input = ort.GetInput(i);
-        if (use_random) {
-            for (int j = 0; j < input.size(); ++j)
-                input[j] = static_cast<float>(std::rand()) / RAND_MAX;
-        } else {
-            input.setZero();
+        if (!ort.CanSetInputFromFloat(i)) {
+            continue;
         }
+        std::vector<float> input(info.total_size, 0.0f);
+        if (use_random) {
+            for (size_t j = 0; j < input.size(); ++j)
+                input[j] = static_cast<float>(std::rand()) / RAND_MAX;
+        }
+        ort.SetInputFromFloat(i, input.data(), input.size());
     }
     for (int i = 0; i < r.output_count; ++i) {
         const auto &info = ort.GetOutputInfo(i);
@@ -109,7 +112,10 @@ static ModelResult test_model(const std::string &model_path, bool use_random) {
     double total_ms = 0;
     for (int i = 0; i < NUM_ITERATIONS; ++i) {
         auto t0 = std::chrono::steady_clock::now();
-        ort.Run();
+        if (!ort.Run()) {
+            r.error = "推理失败: " + ort.GetLastError();
+            return r;
+        }
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         total_ms += ms;
@@ -233,16 +239,16 @@ int main(int argc, char *argv[]) {
         std::cout << io_line << "\n";
         std::cout.flush();  // 确保崩溃前已写入管道
 
-        // 阶段3：填充输入
-        for (int i = 0; i < in_cnt; ++i)
-            ort.GetInput(i).setZero();
-
-        // 阶段4：推理（可能崩溃）
+        // 阶段3：推理（输入缓冲区初始化为零，执行时可能崩溃）
         double total_ms = 0;
         double min_ms = 1e9, max_ms = 0;
         for (int i = 0; i < NUM_ITERATIONS; ++i) {
             auto t0 = std::chrono::steady_clock::now();
-            ort.Run();
+            if (!ort.Run()) {
+                std::cout << "ERROR:" << ort.GetLastError() << "\n";
+                std::cout.flush();
+                return 1;
+            }
             auto t1 = std::chrono::steady_clock::now();
             double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             total_ms += ms;
@@ -380,7 +386,16 @@ int main(int argc, char *argv[]) {
             } else if (output.find("STAGE:load_fail") != std::string::npos) {
                 r.error = "模型加载失败";
             } else if (!r.infer_ok) {
-                r.error = "推理失败（未知原因）";
+                auto error_pos = output.find("ERROR:");
+                if (error_pos != std::string::npos) {
+                    auto error_end = output.find('\n', error_pos);
+                    r.error = output.substr(
+                        error_pos + 6,
+                        error_end == std::string::npos
+                            ? std::string::npos : error_end - error_pos - 6);
+                } else {
+                    r.error = "推理失败（未知原因）";
+                }
             }
 
             // 解析 BACKTRACE 行（信号处理器写入）
@@ -406,13 +421,30 @@ int main(int argc, char *argv[]) {
     // ---- 单模型模式 ----
     if (argc < 2) {
         std::cerr << "用法:\n"
-                << "  单模型: " << argv[0] << " <model.onnx> [--random]\n"
+                << "  单模型: " << argv[0]
+                << " <model.onnx> [--random] [--iterations N]\n"
                 << "  批量:   " << argv[0] << " --scan [robot_dir]\n";
         return 1;
     }
 
     const std::string model_path = argv[1];
-    bool use_random = (argc >= 3 && std::string(argv[2]) == "--random");
+    bool use_random = false;
+    int num_iterations = NUM_ITERATIONS;
+    for (int i = 2; i < argc; ++i) {
+        const std::string option = argv[i];
+        if (option == "--random") {
+            use_random = true;
+        } else if (option == "--iterations" && i + 1 < argc) {
+            num_iterations = std::stoi(argv[++i]);
+            if (num_iterations <= 0) {
+                std::cerr << "[错误] --iterations 必须为正整数\n";
+                return 1;
+            }
+        } else {
+            std::cerr << "[错误] 未知或不完整参数: " << option << "\n";
+            return 1;
+        }
+    }
 
     OnnxRuntimeClass ort;
     if (!ort.Init(model_path)) {
@@ -421,36 +453,61 @@ int main(int argc, char *argv[]) {
     }
     ort.PrintModelInfo();
 
+    try {
+        ort.GetOutput(0);
+        std::cerr << "[错误] 首次推理前输出可被读取\n";
+        return 1;
+    } catch (const std::runtime_error &) {
+    }
+
     for (int i = 0; i < ort.GetInputCount(); ++i) {
-        auto &input = ort.GetInput(i);
+        const auto &info = ort.GetInputInfo(i);
+        if (!ort.CanSetInputFromFloat(i)) {
+            std::cout << "[test] 输入[" << i << "] " << info.element_type_name
+                    << " 不支持 float 转换，保留原生零值\n";
+            continue;
+        }
+        const auto input_size = static_cast<size_t>(ort.GetInputInfo(i).total_size);
+        std::vector<float> input(input_size, 0.0f);
         if (use_random) {
-            for (int j = 0; j < input.size(); ++j)
+            for (size_t j = 0; j < input.size(); ++j)
                 input[j] = static_cast<float>(std::rand()) / RAND_MAX;
             std::cout << "[test] 输入[" << i << "] 随机值，维度=" << input.size() << "\n";
         } else {
-            input.setZero();
             std::cout << "[test] 输入[" << i << "] 全零，维度=" << input.size() << "\n";
         }
+        ort.SetInputFromFloat(i, input.data(), input.size());
     }
 
-    std::cout << "\n[test] 执行推理 (" << NUM_ITERATIONS << " 次迭代)...\n";
+    std::cout << "\n[test] 执行推理 (" << num_iterations << " 次迭代)...\n";
     double total_ms = 0;
     double min_ms = 1e9, max_ms = 0;
-    for (int i = 0; i < NUM_ITERATIONS; ++i) {
+    for (int i = 0; i < num_iterations; ++i) {
         auto t0 = std::chrono::steady_clock::now();
-        ort.Run();
+        if (!ort.Run()) {
+            std::cerr << "[test] 推理失败: " << ort.GetLastError() << "\n";
+            return 1;
+        }
         auto t1 = std::chrono::steady_clock::now();
         double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         total_ms += ms;
         min_ms = std::min(min_ms, ms);
         max_ms = std::max(max_ms, ms);
     }
-    std::cout << "[test] 推理完成. 平均耗时: " << (total_ms / NUM_ITERATIONS)
+    std::cout << "[test] 推理完成. 平均耗时: " << (total_ms / num_iterations)
             << " ms, Min: " << min_ms << " ms, Max: " << max_ms << " ms\n\n";
 
     for (int i = 0; i < ort.GetOutputCount(); ++i) {
-        const auto &output = ort.GetOutput(i);
         const auto &info = ort.GetOutputInfo(i);
+        if (!ort.CanGetOutputAsFloat(i)) {
+            const auto output = ort.GetOutputView(i);
+            std::cout << "输出[" << i << "] " << info.name
+                    << "  dtype=" << info.element_type_name
+                    << "  元素数=" << output.element_count
+                    << "  字节数=" << output.byte_count << "（原生视图）\n";
+            continue;
+        }
+        const auto &output = ort.GetOutput(i);
         std::cout << "输出[" << i << "] " << info.name << "  维度=" << output.size() << "\n  值: [";
         int n = std::min(static_cast<int>(output.size()), 20);
         for (int j = 0; j < n; ++j) {

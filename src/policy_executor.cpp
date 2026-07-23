@@ -16,8 +16,10 @@
 #include <cmath>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -68,22 +70,48 @@ public:
     std::vector<SegmentRuntime> segments;
 
     bool initialized = false;
-    bool has_lstm = false;
     bool has_obs_hist = false;
     int obs_dim = 0;
     int action_dim = 0;
     int expected_obs_dim = 0;
-    int obs_hist_len = 0;
 
-    // LSTM 状态
-    Eigen::VectorXf h_state;
-    Eigen::VectorXf c_state;
+    struct InputBindingRuntime {
+        ModelInputBindingConfig binding;
+        int input_index = -1;
+        int observation_offset = -1;
+        int feedback_output_index = -1;
+        int history_source_runtime_index = -1;
+        int history_length = 0;
+        Eigen::VectorXf value;
+        std::vector<Eigen::VectorXf> history;
+        bool ready = false;
+    };
 
-    // 历史观测窗口（obs_hist 输入张量的模型）
-    std::vector<Eigen::VectorXf> obs_hist;
+    struct InputCompilation {
+        std::set<std::string> used_inputs;
+        std::set<std::string> feedback_outputs;
+        std::unordered_map<std::string, size_t> runtime_by_name;
+        std::vector<std::string> observation_inputs;
+    };
+
+    std::vector<InputBindingRuntime> input_bindings;
+    int feedback_state_count = 0;
+    int action_output_index = -1;
+    std::unordered_map<std::string, size_t> external_input_bindings;
+    std::unordered_map<std::string, int> exposed_output_indices;
+    bool outputs_ready = false;
 
     // 内部维护的平滑动作，用于 last_action 与输出一致
     std::vector<double> blended_action;
+
+    int FindInput(const std::string &name) const;
+    int FindOutput(const std::string &name) const;
+    void ResetModelIOState();
+    InputCompilation CompileModelInputs();
+    void CompileObservationHistories(const InputCompilation &compilation);
+    void CompileModelOutputs(const std::set<std::string> &feedback_outputs);
+    void ValidateActionConfig() const;
+    void CompileModelIO();
 };
 
 namespace {
@@ -104,7 +132,430 @@ double ClampBlendRatio(double ratio) {
     return std::clamp(ratio, 0.0, 1.0);
 }
 
+void FillInitialValue(
+    const std::vector<float> &values,
+    Eigen::VectorXf &target,
+    const std::string &name) {
+    if (values.empty()) {
+        throw std::runtime_error("[PolicyExecutor] 张量缺少初始值: " + name);
+    }
+    if (values.size() == 1) {
+        target.setConstant(values.front());
+        return;
+    }
+    if (values.size() != static_cast<size_t>(target.size())) {
+        throw std::runtime_error(
+            "[PolicyExecutor] 张量初始值维度错误: " + name + ", 实际=" +
+            std::to_string(values.size()) + ", 期望=1 或 " + std::to_string(target.size()));
+    }
+    for (int i = 0; i < target.size(); ++i) target[i] = values[i];
+}
+
+void ValidateClip(const std::vector<double> &clip, int dim, const std::string &name) {
+    if (clip.empty()) return;
+    if (clip.size() != 1 && clip.size() != static_cast<size_t>(dim)) {
+        throw std::runtime_error(
+            "[PolicyExecutor] " + name + " 维度错误: 实际=" + std::to_string(clip.size()) +
+            ", 期望=1 或 " + std::to_string(dim));
+    }
+    for (double value : clip) {
+        if (!std::isfinite(value) || value <= 0.0) {
+            throw std::runtime_error("[PolicyExecutor] " + name + " 必须是有限正数");
+        }
+    }
+}
+
+float ClipValue(float value, const std::vector<double> &clip, int index) {
+    if (clip.empty()) return value;
+    const double limit = clip.size() == 1 ? clip.front() : clip[index];
+    return static_cast<float>(std::clamp(static_cast<double>(value), -limit, limit));
+}
+
+void ValidateBatchOne(
+    const onnx_runtime::TensorInfo &info, const std::string &semantic) {
+    if (info.shape.size() >= 2 && info.shape.front() != 1) {
+        throw std::runtime_error(
+            "[PolicyExecutor] " + semantic + " 仅支持 batch=1: " + info.name +
+            " 的 batch=" + std::to_string(info.shape.front()));
+    }
+}
+
+void ValidateFloatInput(
+    const onnx_runtime::OnnxRuntimeClass &onnx,
+    int input_index,
+    const std::string &source) {
+    if (!onnx.CanSetInputFromFloat(input_index)) {
+        const auto &info = onnx.GetInputInfo(input_index);
+        throw std::runtime_error(
+            "[PolicyExecutor] " + source + " 输入不支持 float 语义转换: " +
+            info.name + " (" + info.element_type_name + ")");
+    }
+}
+
+onnx_runtime::TensorElementType ToBackendTensorType(TensorElementType type) {
+    switch (type) {
+    case TensorElementType::FLOAT32: return onnx_runtime::TensorElementType::FLOAT32;
+    case TensorElementType::UINT8: return onnx_runtime::TensorElementType::UINT8;
+    case TensorElementType::INT8: return onnx_runtime::TensorElementType::INT8;
+    case TensorElementType::UINT16: return onnx_runtime::TensorElementType::UINT16;
+    case TensorElementType::INT16: return onnx_runtime::TensorElementType::INT16;
+    case TensorElementType::INT32: return onnx_runtime::TensorElementType::INT32;
+    case TensorElementType::INT64: return onnx_runtime::TensorElementType::INT64;
+    case TensorElementType::STRING: return onnx_runtime::TensorElementType::STRING;
+    case TensorElementType::BOOL: return onnx_runtime::TensorElementType::BOOL;
+    case TensorElementType::FLOAT16: return onnx_runtime::TensorElementType::FLOAT16;
+    case TensorElementType::FLOAT64: return onnx_runtime::TensorElementType::FLOAT64;
+    case TensorElementType::UINT32: return onnx_runtime::TensorElementType::UINT32;
+    case TensorElementType::UINT64: return onnx_runtime::TensorElementType::UINT64;
+    case TensorElementType::COMPLEX64: return onnx_runtime::TensorElementType::COMPLEX64;
+    case TensorElementType::COMPLEX128: return onnx_runtime::TensorElementType::COMPLEX128;
+    case TensorElementType::BFLOAT16: return onnx_runtime::TensorElementType::BFLOAT16;
+    case TensorElementType::FLOAT8E4M3FN:
+        return onnx_runtime::TensorElementType::FLOAT8E4M3FN;
+    case TensorElementType::FLOAT8E4M3FNUZ:
+        return onnx_runtime::TensorElementType::FLOAT8E4M3FNUZ;
+    case TensorElementType::FLOAT8E5M2:
+        return onnx_runtime::TensorElementType::FLOAT8E5M2;
+    case TensorElementType::FLOAT8E5M2FNUZ:
+        return onnx_runtime::TensorElementType::FLOAT8E5M2FNUZ;
+    case TensorElementType::UINT4: return onnx_runtime::TensorElementType::UINT4;
+    case TensorElementType::INT4: return onnx_runtime::TensorElementType::INT4;
+    case TensorElementType::UNDEFINED:
+    default:
+        return onnx_runtime::TensorElementType::UNDEFINED;
+    }
+}
+
+TensorElementType FromBackendTensorType(onnx_runtime::TensorElementType type) {
+    switch (type) {
+    case onnx_runtime::TensorElementType::FLOAT32: return TensorElementType::FLOAT32;
+    case onnx_runtime::TensorElementType::UINT8: return TensorElementType::UINT8;
+    case onnx_runtime::TensorElementType::INT8: return TensorElementType::INT8;
+    case onnx_runtime::TensorElementType::UINT16: return TensorElementType::UINT16;
+    case onnx_runtime::TensorElementType::INT16: return TensorElementType::INT16;
+    case onnx_runtime::TensorElementType::INT32: return TensorElementType::INT32;
+    case onnx_runtime::TensorElementType::INT64: return TensorElementType::INT64;
+    case onnx_runtime::TensorElementType::STRING: return TensorElementType::STRING;
+    case onnx_runtime::TensorElementType::BOOL: return TensorElementType::BOOL;
+    case onnx_runtime::TensorElementType::FLOAT16: return TensorElementType::FLOAT16;
+    case onnx_runtime::TensorElementType::FLOAT64: return TensorElementType::FLOAT64;
+    case onnx_runtime::TensorElementType::UINT32: return TensorElementType::UINT32;
+    case onnx_runtime::TensorElementType::UINT64: return TensorElementType::UINT64;
+    case onnx_runtime::TensorElementType::COMPLEX64: return TensorElementType::COMPLEX64;
+    case onnx_runtime::TensorElementType::COMPLEX128: return TensorElementType::COMPLEX128;
+    case onnx_runtime::TensorElementType::BFLOAT16: return TensorElementType::BFLOAT16;
+    case onnx_runtime::TensorElementType::FLOAT8E4M3FN:
+        return TensorElementType::FLOAT8E4M3FN;
+    case onnx_runtime::TensorElementType::FLOAT8E4M3FNUZ:
+        return TensorElementType::FLOAT8E4M3FNUZ;
+    case onnx_runtime::TensorElementType::FLOAT8E5M2:
+        return TensorElementType::FLOAT8E5M2;
+    case onnx_runtime::TensorElementType::FLOAT8E5M2FNUZ:
+        return TensorElementType::FLOAT8E5M2FNUZ;
+    case onnx_runtime::TensorElementType::UINT4: return TensorElementType::UINT4;
+    case onnx_runtime::TensorElementType::INT4: return TensorElementType::INT4;
+    case onnx_runtime::TensorElementType::UNDEFINED:
+    default:
+        return TensorElementType::UNDEFINED;
+    }
+}
+
 }  // namespace
+
+int PolicyExecutor::Impl::FindInput(const std::string &name) const {
+    for (int i = 0; i < onnx.GetInputCount(); ++i) {
+        if (onnx.GetInputInfo(i).name == name) return i;
+    }
+    return -1;
+}
+
+int PolicyExecutor::Impl::FindOutput(const std::string &name) const {
+    for (int i = 0; i < onnx.GetOutputCount(); ++i) {
+        if (onnx.GetOutputInfo(i).name == name) return i;
+    }
+    return -1;
+}
+
+void PolicyExecutor::Impl::ResetModelIOState() {
+    obs_dim = 0;
+    action_dim = 0;
+    has_obs_hist = false;
+    feedback_state_count = 0;
+    action_output_index = -1;
+    input_bindings.clear();
+    external_input_bindings.clear();
+    exposed_output_indices.clear();
+    outputs_ready = false;
+    blended_action.clear();
+}
+
+PolicyExecutor::Impl::InputCompilation PolicyExecutor::Impl::CompileModelInputs() {
+    InputCompilation compilation;
+    int next_observation_offset = 0;
+
+    for (const auto &binding : cfg.model_io.inputs) {
+        const int input_index = FindInput(binding.name);
+        if (input_index < 0) {
+            throw std::runtime_error("[PolicyExecutor] model_io 输入不存在: " + binding.name);
+        }
+        if (!compilation.used_inputs.insert(binding.name).second) {
+            throw std::runtime_error(
+                "[PolicyExecutor] model_io 输入重复绑定: " + binding.name);
+        }
+
+        const auto &input_info = onnx.GetInputInfo(input_index);
+        InputBindingRuntime runtime;
+        runtime.binding = binding;
+        runtime.input_index = input_index;
+        runtime.value.setZero(static_cast<int>(input_info.total_size));
+
+        switch (binding.source) {
+        case ModelInputSource::OBSERVATION: {
+            ValidateBatchOne(input_info, "observation");
+            ValidateFloatInput(onnx, input_index, "observation");
+            const int offset = binding.observation_offset >= 0
+                ? binding.observation_offset : next_observation_offset;
+            runtime.observation_offset = offset;
+            next_observation_offset = std::max(
+                next_observation_offset,
+                offset + static_cast<int>(input_info.total_size));
+            obs_dim = std::max(
+                obs_dim, offset + static_cast<int>(input_info.total_size));
+            compilation.observation_inputs.push_back(binding.name);
+            runtime.ready = true;
+            break;
+        }
+        case ModelInputSource::FEEDBACK: {
+            if (binding.feedback_output.empty()) {
+                throw std::runtime_error(
+                    "[PolicyExecutor] feedback 输入缺少 output: " + binding.name);
+            }
+            const int output_index = FindOutput(binding.feedback_output);
+            if (output_index < 0) {
+                throw std::runtime_error(
+                    "[PolicyExecutor] feedback 输出不存在: " + binding.feedback_output);
+            }
+            const auto &output_info = onnx.GetOutputInfo(output_index);
+            if (input_info.total_size != output_info.total_size) {
+                throw std::runtime_error(
+                    "[PolicyExecutor] feedback 输入输出元素数不一致: " + binding.name +
+                    " <- " + binding.feedback_output);
+            }
+            if (input_info.element_type != output_info.element_type) {
+                throw std::runtime_error(
+                    "[PolicyExecutor] feedback 输入输出 dtype 不一致: " + binding.name +
+                    " <- " + binding.feedback_output);
+            }
+            if (!binding.initial_value.empty()) {
+                FillInitialValue(binding.initial_value, runtime.value, binding.name);
+            }
+            compilation.feedback_outputs.insert(binding.feedback_output);
+            runtime.feedback_output_index = output_index;
+            runtime.ready = true;
+            ++feedback_state_count;
+            break;
+        }
+        case ModelInputSource::CONSTANT:
+            FillInitialValue(binding.initial_value, runtime.value, binding.name);
+            runtime.ready = true;
+            break;
+        case ModelInputSource::EXTERNAL: {
+            if (!binding.initial_value.empty()) {
+                FillInitialValue(binding.initial_value, runtime.value, binding.name);
+                runtime.ready = true;
+            }
+            const std::string key = binding.key.empty() ? binding.name : binding.key;
+            if (external_input_bindings.count(key) > 0) {
+                throw std::runtime_error("[PolicyExecutor] external 输入 key 重复: " + key);
+            }
+            external_input_bindings[key] = input_bindings.size();
+            break;
+        }
+        case ModelInputSource::OBSERVATION_HISTORY:
+            ValidateBatchOne(input_info, "observation_history");
+            ValidateFloatInput(onnx, input_index, "observation_history");
+            runtime.ready = true;
+            break;
+        }
+
+        // ONNX backend 已按原生 dtype 将输入清零。空初值的 feedback 直接复用该
+        // 缓冲区，避免 FP8/INT4 等无 float 自动转换路径的状态张量初始化失败。
+        if (!binding.initial_value.empty() &&
+            (binding.source == ModelInputSource::FEEDBACK ||
+            binding.source == ModelInputSource::CONSTANT ||
+            binding.source == ModelInputSource::EXTERNAL)) {
+            onnx.SetInputFromFloat(
+                runtime.input_index, runtime.value.data(), runtime.value.size());
+        }
+
+        compilation.runtime_by_name[binding.name] = input_bindings.size();
+        input_bindings.push_back(std::move(runtime));
+    }
+
+    for (int i = 0; i < onnx.GetInputCount(); ++i) {
+        const auto &name = onnx.GetInputInfo(i).name;
+        if (compilation.used_inputs.count(name) == 0) {
+            throw std::runtime_error("[PolicyExecutor] 未绑定的 ONNX 输入: " + name);
+        }
+    }
+    if (compilation.observation_inputs.empty()) {
+        throw std::runtime_error("[PolicyExecutor] model_io 至少需要一个 observation 输入");
+    }
+    return compilation;
+}
+
+void PolicyExecutor::Impl::CompileObservationHistories(
+    const InputCompilation &compilation) {
+    for (auto &runtime : input_bindings) {
+        if (runtime.binding.source != ModelInputSource::OBSERVATION_HISTORY) continue;
+
+        std::string source = runtime.binding.history_source;
+        if (source.empty() && compilation.observation_inputs.size() == 1) {
+            source = compilation.observation_inputs.front();
+        }
+        if (source.empty()) {
+            throw std::runtime_error(
+                "[PolicyExecutor] observation_history 缺少 history_of: " +
+                runtime.binding.name);
+        }
+        const auto source_it = compilation.runtime_by_name.find(source);
+        if (source_it == compilation.runtime_by_name.end()) {
+            throw std::runtime_error(
+                "[PolicyExecutor] history_of 输入不存在: " + runtime.binding.name +
+                " <- " + source);
+        }
+        auto &source_runtime = input_bindings[source_it->second];
+        if (source_runtime.binding.source != ModelInputSource::OBSERVATION) {
+            throw std::runtime_error(
+                "[PolicyExecutor] observation_history 只能跟踪 observation 输入: " +
+                runtime.binding.name + " <- " + source);
+        }
+        const int frame_size = static_cast<int>(source_runtime.value.size());
+        if (frame_size <= 0 || runtime.value.size() <= 0 ||
+            runtime.value.size() % frame_size != 0) {
+            throw std::runtime_error(
+                "[PolicyExecutor] observation_history 形状无法匹配源输入: " +
+                runtime.binding.name + " <- " + source);
+        }
+        runtime.history_source_runtime_index = static_cast<int>(source_it->second);
+        runtime.history_length = static_cast<int>(runtime.value.size()) / frame_size;
+        runtime.history.assign(runtime.history_length, Eigen::VectorXf::Zero(frame_size));
+        has_obs_hist = true;
+    }
+}
+
+void PolicyExecutor::Impl::CompileModelOutputs(
+    const std::set<std::string> &feedback_outputs) {
+    std::set<std::string> declared_outputs;
+
+    for (const auto &binding : cfg.model_io.outputs) {
+        const int output_index = FindOutput(binding.name);
+        if (output_index < 0) {
+            throw std::runtime_error("[PolicyExecutor] model_io 输出不存在: " + binding.name);
+        }
+        if (!declared_outputs.insert(binding.name).second) {
+            throw std::runtime_error(
+                "[PolicyExecutor] model_io 输出重复声明: " + binding.name);
+        }
+        const auto &output_info = onnx.GetOutputInfo(output_index);
+        switch (binding.target) {
+        case ModelOutputTarget::ACTION:
+            if (action_output_index >= 0) {
+                throw std::runtime_error("[PolicyExecutor] model_io 只能配置一个 action 输出");
+            }
+            ValidateBatchOne(output_info, "action");
+            if (!onnx.CanGetOutputAsFloat(output_index)) {
+                throw std::runtime_error(
+                    "[PolicyExecutor] action 输出不支持 float 语义转换: " +
+                    output_info.name + " (" + output_info.element_type_name + ")");
+            }
+            action_output_index = output_index;
+            action_dim = static_cast<int>(output_info.total_size);
+            break;
+        case ModelOutputTarget::EXPOSE: {
+            const std::string key = binding.key.empty() ? binding.name : binding.key;
+            if (exposed_output_indices.count(key) > 0) {
+                throw std::runtime_error("[PolicyExecutor] expose 输出 key 重复: " + key);
+            }
+            exposed_output_indices[key] = output_index;
+            break;
+        }
+        case ModelOutputTarget::IGNORE:
+            break;
+        }
+    }
+
+    if (action_output_index < 0) {
+        throw std::runtime_error("[PolicyExecutor] model_io 缺少 action 输出");
+    }
+    for (int i = 0; i < onnx.GetOutputCount(); ++i) {
+        const auto &name = onnx.GetOutputInfo(i).name;
+        if (feedback_outputs.count(name) == 0 && declared_outputs.count(name) == 0) {
+            throw std::runtime_error("[PolicyExecutor] 未绑定的 ONNX 输出: " + name);
+        }
+    }
+}
+
+void PolicyExecutor::Impl::ValidateActionConfig() const {
+    if (cfg.action_scale.empty()) {
+        throw std::runtime_error("[PolicyExecutor] action_scale 不能为空");
+    }
+    if (cfg.action_scale.size() != 1 &&
+        cfg.action_scale.size() != static_cast<size_t>(action_dim)) {
+        throw std::runtime_error(
+            "[PolicyExecutor] action_scale 维度错误: 实际=" +
+            std::to_string(cfg.action_scale.size()) + ", 期望=1 或 " +
+            std::to_string(action_dim));
+    }
+    if (!cfg.action_joint_index.empty() &&
+        cfg.action_joint_index.size() != static_cast<size_t>(action_dim)) {
+        throw std::runtime_error(
+            "[PolicyExecutor] action_joint_index 维度错误: 实际=" +
+            std::to_string(cfg.action_joint_index.size()) + ", 期望=" +
+            std::to_string(action_dim));
+    }
+    if (cfg.action_joint_index.empty() &&
+        action_dim > static_cast<int>(cfg.rl_default_pos.size())) {
+        throw std::runtime_error(
+            "[PolicyExecutor] action 维度大于关节数，必须配置 action_joint_index");
+    }
+
+    std::set<int> mapped_joints;
+    for (int index : cfg.action_joint_index) {
+        if (index < 0 || index >= static_cast<int>(cfg.rl_default_pos.size())) {
+            throw std::runtime_error(
+                "[PolicyExecutor] action_joint_index 越界: " + std::to_string(index));
+        }
+        if (!mapped_joints.insert(index).second) {
+            throw std::runtime_error(
+                "[PolicyExecutor] action_joint_index 重复: " + std::to_string(index));
+        }
+    }
+}
+
+void PolicyExecutor::Impl::CompileModelIO() {
+    if (cfg.model_io.inputs.empty() || cfg.model_io.outputs.empty()) {
+        throw std::runtime_error(
+            "[PolicyExecutor] model_io 必须包含非空 inputs 和 outputs");
+    }
+    if (onnx.GetInputCount() == 0 || onnx.GetOutputCount() == 0) {
+        throw std::runtime_error("[PolicyExecutor] ONNX 模型至少需要一个输入和一个输出");
+    }
+
+    const InputCompilation compilation = CompileModelInputs();
+    CompileObservationHistories(compilation);
+    CompileModelOutputs(compilation.feedback_outputs);
+    ValidateActionConfig();
+    ValidateClip(cfg.clip_observations, obs_dim, "clip_observations");
+    ValidateClip(cfg.clip_actions, action_dim, "clip_actions");
+
+    std::cout << "[PolicyExecutor] model_io: 严格声明"
+        << ", obs_dim=" << obs_dim << ", action_dim=" << action_dim
+        << ", feedback=" << feedback_state_count
+        << ", history=" << (has_obs_hist ? "yes" : "no")
+        << ", external=" << external_input_bindings.size()
+        << ", expose=" << exposed_output_indices.size() << std::endl;
+}
 
 // ============================================================
 // PolicyExecutor 公共接口
@@ -123,8 +574,8 @@ int PolicyExecutor::ObsDim() const {
 int PolicyExecutor::ActionDim() const {
     return impl_->action_dim;
 }
-bool PolicyExecutor::HasLstm() const {
-    return impl_->has_lstm;
+int PolicyExecutor::FeedbackStateCount() const {
+    return impl_->feedback_state_count;
 }
 bool PolicyExecutor::HasObsHist() const {
     return impl_->has_obs_hist;
@@ -148,11 +599,85 @@ void PolicyExecutor::SetCustomArray(const std::string &name, const float *data, 
     impl_->term_calc.SetCustomArray(name, data, size);
 }
 
+void PolicyExecutor::SetModelInput(const std::string &key, const float *data, int size) {
+    if (!impl_->initialized) {
+        throw std::runtime_error("[PolicyExecutor] 未初始化");
+    }
+    const auto it = impl_->external_input_bindings.find(key);
+    if (it == impl_->external_input_bindings.end()) {
+        throw std::runtime_error("[PolicyExecutor] external 输入不存在: " + key);
+    }
+    auto &runtime = impl_->input_bindings[it->second];
+    if (!data || size != runtime.value.size()) {
+        throw std::runtime_error(
+            "[PolicyExecutor] external 输入维度错误: " + key + ", 实际=" +
+            std::to_string(size) + ", 期望=" + std::to_string(runtime.value.size()));
+    }
+    runtime.value = Eigen::Map<const Eigen::VectorXf>(data, size);
+    impl_->onnx.SetInputFromFloat(runtime.input_index, data, size);
+    runtime.ready = true;
+}
+
+void PolicyExecutor::SetModelInput(const std::string &key, const TensorView &input) {
+    if (!impl_->initialized) {
+        throw std::runtime_error("[PolicyExecutor] 未初始化");
+    }
+    const auto it = impl_->external_input_bindings.find(key);
+    if (it == impl_->external_input_bindings.end()) {
+        throw std::runtime_error("[PolicyExecutor] external 输入不存在: " + key);
+    }
+    auto &runtime = impl_->input_bindings[it->second];
+    if (input.element_count != static_cast<size_t>(runtime.value.size())) {
+        throw std::runtime_error(
+            "[PolicyExecutor] external 输入维度错误: " + key + ", 实际=" +
+            std::to_string(input.element_count) + ", 期望=" +
+            std::to_string(runtime.value.size()));
+    }
+    impl_->onnx.SetInput(
+        runtime.input_index,
+        {
+            ToBackendTensorType(input.element_type),
+            input.data,
+            input.element_count,
+            input.byte_count,
+        });
+    runtime.ready = true;
+}
+
+const std::vector<float> &PolicyExecutor::GetModelOutput(const std::string &key) const {
+    const auto it = impl_->exposed_output_indices.find(key);
+    if (it == impl_->exposed_output_indices.end()) {
+        throw std::runtime_error("[PolicyExecutor] expose 输出不存在: " + key);
+    }
+    if (!impl_->outputs_ready) {
+        throw std::runtime_error("[PolicyExecutor] 尚未完成推理，输出不可用: " + key);
+    }
+    return impl_->onnx.GetOutput(it->second);
+}
+
+TensorView PolicyExecutor::GetModelOutputTensor(const std::string &key) const {
+    const auto it = impl_->exposed_output_indices.find(key);
+    if (it == impl_->exposed_output_indices.end()) {
+        throw std::runtime_error("[PolicyExecutor] expose 输出不存在: " + key);
+    }
+    if (!impl_->outputs_ready) {
+        throw std::runtime_error("[PolicyExecutor] 尚未完成推理，输出不可用: " + key);
+    }
+    const auto output = impl_->onnx.GetOutputView(it->second);
+    return {
+        FromBackendTensorType(output.element_type),
+        output.data,
+        output.element_count,
+        output.byte_count,
+    };
+}
+
 // ============================================================
 // init
 // ============================================================
 
 void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
+    impl_->initialized = false;
     impl_->cfg = cfg;
     impl_->cfg.action_blend_ratio = ClampBlendRatio(impl_->cfg.action_blend_ratio);
     impl_->segments.clear();
@@ -171,54 +696,10 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     }
     impl_->onnx.PrintModelInfo();
 
-    impl_->obs_dim = static_cast<int>(impl_->onnx.GetInputInfo(0).total_size);
-    impl_->action_dim = static_cast<int>(impl_->onnx.GetOutputInfo(0).total_size);
-    impl_->has_lstm = false;
-    impl_->has_obs_hist = false;
+    impl_->ResetModelIOState();
+    impl_->CompileModelIO();
 
-    auto has_input = [&](const std::string &name) -> int {
-        for (int i = 0; i < impl_->onnx.GetInputCount(); ++i) {
-            if (impl_->onnx.GetInputInfo(i).name == name) return i;
-        }
-        return -1;
-    };
-
-    int h_idx = has_input("h_in");
-    int c_idx = has_input("c_in");
-    if (h_idx >= 0 && c_idx >= 0) {
-        impl_->has_lstm = true;
-        const int h_dim = static_cast<int>(impl_->onnx.GetInputInfo(h_idx).total_size);
-        const int c_dim = static_cast<int>(impl_->onnx.GetInputInfo(c_idx).total_size);
-        impl_->h_state.setZero(h_dim);
-        impl_->c_state.setZero(c_dim);
-        std::cout << "[PolicyExecutor] LSTM 模型: obs_dim=" << impl_->obs_dim
-                << ", action_dim=" << impl_->action_dim << ", h_dim=" << h_dim
-                << ", c_dim=" << c_dim << std::endl;
-    }
-
-    if (!impl_->has_lstm && impl_->onnx.GetInputCount() >= 2) {
-        const auto &second = impl_->onnx.GetInputInfo(1);
-        if (second.shape.size() == 3 && second.shape[0] == 1 &&
-            static_cast<int>(second.shape[2]) == impl_->obs_dim) {
-            impl_->has_obs_hist = true;
-            impl_->obs_hist_len = static_cast<int>(second.shape[1]);
-            impl_->obs_hist.clear();
-            impl_->obs_hist.resize(
-                impl_->obs_hist_len, Eigen::VectorXf::Zero(impl_->obs_dim));
-            std::cout << "[PolicyExecutor] 带历史观测模型: obs_dim=" << impl_->obs_dim
-                    << ", action_dim=" << impl_->action_dim
-                    << ", obs_hist_len=" << impl_->obs_hist_len << std::endl;
-        }
-    }
-
-    if (!impl_->has_lstm && !impl_->has_obs_hist) {
-        std::cout << "[PolicyExecutor] MLP 模型: obs_dim=" << impl_->obs_dim
-                << ", action_dim=" << impl_->action_dim
-                << " (" << impl_->onnx.GetInputCount() << " 输入, "
-                << impl_->onnx.GetOutputCount() << " 输出)" << std::endl;
-    }
-
-    // 所有模型类型都需要初始化内部动作缓冲
+    // 初始化内部动作缓冲
     impl_->blended_action.assign(impl_->action_dim, 0.0);
 
     // ---- 初始化 term 计算器 ----
@@ -386,43 +867,69 @@ void PolicyExecutor::Infer(const Eigen::VectorXf &obs, std::vector<double> &out_
             "[PolicyExecutor] 观测维度错误: 实际=" + std::to_string(obs.size()) +
             ", 期望=" + std::to_string(impl_->obs_dim));
     }
+    impl_->outputs_ready = false;
 
-    impl_->onnx.GetInput(0) = obs;
+    Eigen::VectorXf clipped_obs = obs;
+    for (int i = 0; i < clipped_obs.size(); ++i) {
+        clipped_obs[i] = ClipValue(clipped_obs[i], impl_->cfg.clip_observations, i);
+    }
 
-    if (impl_->has_obs_hist) {
-        if (static_cast<int>(impl_->obs_hist.size()) >= impl_->obs_hist_len) {
-            impl_->obs_hist.erase(impl_->obs_hist.begin());
+    for (auto &runtime : impl_->input_bindings) {
+        switch (runtime.binding.source) {
+        case ModelInputSource::OBSERVATION: {
+            runtime.value = clipped_obs.segment(
+                runtime.observation_offset, runtime.value.size());
+            impl_->onnx.SetInputFromFloat(
+                runtime.input_index, runtime.value.data(), runtime.value.size());
+            break;
         }
-        impl_->obs_hist.push_back(obs);
-
-        auto &hist_input = impl_->onnx.GetInput(1);
-        const int total_hist = impl_->obs_hist_len * impl_->obs_dim;
-        if (hist_input.size() != total_hist)
-            hist_input.resize(total_hist);
-        for (int t = 0; t < impl_->obs_hist_len; ++t) {
-            if (t < static_cast<int>(impl_->obs_hist.size())) {
-                hist_input.segment(t * impl_->obs_dim, impl_->obs_dim) = impl_->obs_hist[t];
-            } else {
-                hist_input.segment(t * impl_->obs_dim, impl_->obs_dim) = obs;
+        case ModelInputSource::FEEDBACK:
+        case ModelInputSource::CONSTANT:
+            break;
+        case ModelInputSource::EXTERNAL:
+            if (!runtime.ready) {
+                const std::string key = runtime.binding.key.empty()
+                    ? runtime.binding.name : runtime.binding.key;
+                throw std::runtime_error(
+                    "[PolicyExecutor] external 输入尚未设置且无默认值: " + key);
             }
+            break;
+        case ModelInputSource::OBSERVATION_HISTORY:
+            break;
         }
-    } else if (impl_->has_lstm) {
-        impl_->onnx.GetInput(1) = impl_->h_state;
-        impl_->onnx.GetInput(2) = impl_->c_state;
     }
 
-    impl_->onnx.Run();
-
-    if (impl_->has_lstm) {
-        impl_->h_state = impl_->onnx.GetOutput(1);
-        impl_->c_state = impl_->onnx.GetOutput(2);
+    for (auto &runtime : impl_->input_bindings) {
+        if (runtime.binding.source != ModelInputSource::OBSERVATION_HISTORY) continue;
+        const auto &source =
+            impl_->input_bindings[runtime.history_source_runtime_index].value;
+        runtime.history.erase(runtime.history.begin());
+        runtime.history.push_back(source);
+        for (int t = 0; t < runtime.history_length; ++t) {
+            runtime.value.segment(t * source.size(), source.size()) = runtime.history[t];
+        }
+        impl_->onnx.SetInputFromFloat(
+            runtime.input_index, runtime.value.data(), runtime.value.size());
     }
 
-    const auto &out = impl_->onnx.GetOutput(0);
+    if (!impl_->onnx.Run()) {
+        throw std::runtime_error(
+            "[PolicyExecutor] ONNX 推理失败: " + impl_->onnx.GetLastError());
+    }
+
+    for (auto &runtime : impl_->input_bindings) {
+        if (runtime.binding.source == ModelInputSource::FEEDBACK) {
+            impl_->onnx.CopyOutputToInput(
+                runtime.feedback_output_index, runtime.input_index);
+        }
+    }
+    impl_->outputs_ready = true;
+
+    const auto &out = impl_->onnx.GetOutput(impl_->action_output_index);
     out_action.resize(out.size());
     const double blend = impl_->cfg.action_blend_ratio;
     for (int i = 0; i < out.size(); ++i) {
-        const double raw = static_cast<double>(out[i]);
+        const double raw = static_cast<double>(ClipValue(out[i], impl_->cfg.clip_actions, i));
         const double prev =
             (i < static_cast<int>(impl_->blended_action.size())) ? impl_->blended_action[i] : 0.0;
         const double blended = blend * raw + (1.0 - blend) * prev;
