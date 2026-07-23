@@ -114,35 +114,56 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 填充随机输入（模拟真实推理场景，避免编译器优化掉零输入）
-    for (int i = 0; i < ort.GetInputCount(); ++i)
-        ort.GetInput(i).setRandom();
+    // float 语义输入填随机值；原生-only dtype 保留 backend 初始化的零张量。
+    int native_zero_inputs = 0;
+    for (int i = 0; i < ort.GetInputCount(); ++i) {
+        if (!ort.CanSetInputFromFloat(i)) {
+            ++native_zero_inputs;
+            continue;
+        }
+        const auto input_size = static_cast<size_t>(ort.GetInputInfo(i).total_size);
+        std::vector<float> input(input_size);
+        for (float &value : input) {
+            value = static_cast<float>(std::rand()) / RAND_MAX;
+        }
+        ort.SetInputFromFloat(i, input.data(), input.size());
+    }
 
-    const int64_t obs_dim = ort.GetInputInfo(0).total_size;
-    const int64_t act_dim = ort.GetOutputInfo(0).total_size;
+    const int64_t first_input_dim = ort.GetInputInfo(0).total_size;
+    const int64_t first_output_dim = ort.GetOutputInfo(0).total_size;
 
     std::cout << CLR_BOLD << std::string(40, '=') << CLR_RESET << "\n"
             << CLR_BOLD << "ONNX Inference Benchmark" << CLR_RESET << "\n"
             << CLR_BOLD << std::string(40, '=') << CLR_RESET << "\n"
             << "Policy:     " << argv[2] << "\n"
             << "Model:      " << model_path << "\n"
-            << "Obs dim:    " << obs_dim << "\n"
-            << "Action dim: " << act_dim << "\n\n"
+            << "Input[0] dim:  " << first_input_dim << "\n"
+            << "Output[0] dim: " << first_output_dim << "\n\n"
+            << "Native zero inputs: " << native_zero_inputs << "\n"
             << "Warmup: " << warmup << " rounds\n"
             << "Test:   " << rounds << " rounds\n"
             << std::flush;
 
     // 预热（消除 ONNX Runtime 图编译、kernel autotune、内存分配等首次开销）
     std::cout << "\n[1/2] 预热中...\n" << std::flush;
-    for (int i = 0; i < warmup; ++i)
-        ort.Run();
+    for (int i = 0; i < warmup; ++i) {
+        if (!ort.Run()) {
+            std::cerr << "[benchmark_onnx_infer] 预热推理失败: "
+                    << ort.GetLastError() << "\n";
+            return 1;
+        }
+    }
 
     // 基准测试
     std::cout << "[2/2] 测试中...\n" << std::flush;
     std::vector<double> latencies(rounds);
     for (int i = 0; i < rounds; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        ort.Run();
+        if (!ort.Run()) {
+            std::cerr << "[benchmark_onnx_infer] 推理失败: "
+                    << ort.GetLastError() << "\n";
+            return 1;
+        }
         auto t1 = std::chrono::high_resolution_clock::now();
         latencies[i] = std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (verbose)

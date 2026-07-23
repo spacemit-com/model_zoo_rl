@@ -23,6 +23,13 @@ rl_policy:
       # ----------------------------------------------------------
       motion:
         model_path: "policy/motion/motion.onnx"  # 相对于 robot_dir
+        model_io:
+          inputs:
+            - {name: obs, source: observation}
+            - {name: h_in, source: feedback, output: h_out}
+            - {name: c_in, source: feedback, output: c_out}
+          outputs:
+            - {name: action, target: action}
 
         # 受 RL 控制的关节索引（12 维腿部关节）
         action_joint_index: [0, 1, 2, 3, 4, 5,
@@ -77,6 +84,11 @@ rl_policy:
       # ----------------------------------------------------------
       dance:
         model_path: "policy/dance/dance_0605.onnx"
+        model_io:
+          inputs:
+            - {name: actor_obs, source: observation}
+          outputs:
+            - {name: action, target: action}
 
         # 受 RL 控制的关节索引（腿12 + 腰3 + 部分臂4，共24维）
         action_joint_index: [0, 1, 2, 3, 4, 5,
@@ -142,6 +154,11 @@ rl_policy:
       # ----------------------------------------------------------
       kungfu:
         model_path: "policy/kungfu/kungfu_0609.onnx"
+        model_io:
+          inputs:
+            - {name: actor_obs, source: observation}
+          outputs:
+            - {name: action, target: action}
 
         action_joint_index: [0, 1, 2, 3, 4, 5,
                              6, 7, 8, 9, 10, 11,

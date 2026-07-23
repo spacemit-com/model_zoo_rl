@@ -7,8 +7,9 @@
  *
  * 演示 PolicyExecutor 所有对外接口的使用方法：
  * - 配置加载（LoadPolicyConfigFromYaml）
- * - 执行器初始化与查询（Init / ObsDim / ActionDim / HasLstm / HasObsHist）
+ * - 执行器初始化与查询（Init / ObsDim / ActionDim / FeedbackStateCount）
  * - 自定义标量（SetCustomScalar / GetCustomScalar）
+ * - 声明式模型 I/O（SetModelInput / GetModelOutput / GetModelOutputTensor）
  * - 观测组装与推理循环（AssembleObs / Infer / MapActionToTargetPos）
  *
  * 用法:
@@ -23,14 +24,112 @@
  *       application/native/humanoid_unitree_g1/
  */
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <functional>
 #include <iostream>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "rl_service.h"
 
 using rl_policy::LoadedPolicyConfig;
 using rl_policy::LoadPolicyConfigFromYaml;
+using rl_policy::ModelInputSource;
+using rl_policy::ModelOutputTarget;
 using rl_policy::PolicyExecutor;
+using rl_policy::TensorElementType;
+
+namespace {
+
+void Require(bool condition, const std::string &message) {
+    if (!condition) throw std::runtime_error("[test] " + message);
+}
+
+void RequireThrows(const std::function<void()> &fn, const std::string &message) {
+    try {
+        fn();
+    } catch (const std::exception &) {
+        return;
+    }
+    throw std::runtime_error("[test] 未正确拒绝: " + message);
+}
+
+std::string InputKey(const rl_policy::ModelInputBindingConfig &binding) {
+    return binding.key.empty() ? binding.name : binding.key;
+}
+
+std::string OutputKey(const rl_policy::ModelOutputBindingConfig &binding) {
+    return binding.key.empty() ? binding.name : binding.key;
+}
+
+bool SupportsFloatView(TensorElementType type) {
+    switch (type) {
+    case TensorElementType::FLOAT32:
+    case TensorElementType::UINT8:
+    case TensorElementType::INT8:
+    case TensorElementType::UINT16:
+    case TensorElementType::INT16:
+    case TensorElementType::INT32:
+    case TensorElementType::INT64:
+    case TensorElementType::BOOL:
+    case TensorElementType::FLOAT16:
+    case TensorElementType::FLOAT64:
+    case TensorElementType::UINT32:
+    case TensorElementType::UINT64:
+    case TensorElementType::BFLOAT16:
+        return true;
+    case TensorElementType::UNDEFINED:
+    case TensorElementType::STRING:
+    case TensorElementType::COMPLEX64:
+    case TensorElementType::COMPLEX128:
+    case TensorElementType::FLOAT8E4M3FN:
+    case TensorElementType::FLOAT8E4M3FNUZ:
+    case TensorElementType::FLOAT8E5M2:
+    case TensorElementType::FLOAT8E5M2FNUZ:
+    case TensorElementType::UINT4:
+    case TensorElementType::INT4:
+        return false;
+    }
+    return false;
+}
+
+void ValidateActionClip(
+    const std::vector<double> &action, const std::vector<double> &clip_actions) {
+    if (clip_actions.empty()) return;
+    Require(
+        clip_actions.size() == 1 || clip_actions.size() == action.size(),
+        "clip_actions 维度错误");
+    for (size_t i = 0; i < action.size(); ++i) {
+        const double limit = std::abs(
+            clip_actions.size() == 1 ? clip_actions.front() : clip_actions[i]);
+        Require(
+            std::abs(action[i]) <= limit + 1e-6,
+            "动作输出超过 clip_actions，index=" + std::to_string(i));
+    }
+}
+
+void ValidateExposedOutputs(
+    const PolicyExecutor &policy, const rl_policy::ModelIOConfig &model_io) {
+    for (const auto &binding : model_io.outputs) {
+        if (binding.target != ModelOutputTarget::EXPOSE) continue;
+        const std::string key = OutputKey(binding);
+        const auto tensor = policy.GetModelOutputTensor(key);
+        Require(tensor.data != nullptr, "expose 输出为空: " + key);
+        Require(tensor.element_count > 0, "expose 输出元素数为 0: " + key);
+        Require(tensor.byte_count > 0, "expose 输出字节数为 0: " + key);
+        if (SupportsFloatView(tensor.element_type)) {
+            const auto &values = policy.GetModelOutput(key);
+            Require(
+                values.size() == tensor.element_count,
+                "expose float 视图维度错误: " + key);
+        }
+    }
+}
+
+}  // namespace
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
@@ -58,6 +157,10 @@ int main(int argc, char *argv[]) {
         // ---- 2. 初始化执行器 ----
         std::cout << "[test] 初始化 PolicyExecutor\n";
         PolicyExecutor policy;
+        const float invalid_input = 0.0f;
+        RequireThrows(
+            [&] { policy.SetModelInput("__uninitialized__", &invalid_input, 1); },
+            "未初始化时设置 external 输入");
         policy.Init(loaded_cfg.exec_cfg);
         policy.PrintModelInfo();
 
@@ -67,8 +170,79 @@ int main(int argc, char *argv[]) {
         std::cout << "========================================\n";
         std::cout << "  观测维度: " << policy.ObsDim() << "\n";
         std::cout << "  动作维度: " << policy.ActionDim() << "\n";
-        std::cout << "  是否为 LSTM 模型: " << (policy.HasLstm() ? "是" : "否") << "\n";
-        std::cout << "  是否使用 obs_hist 输入: " << (policy.HasObsHist() ? "是" : "否") << "\n";
+        std::cout << "  feedback 状态对: " << policy.FeedbackStateCount() << "\n";
+        std::cout << "  是否使用 observation_history 输入: "
+            << (policy.HasObsHist() ? "是" : "否") << "\n";
+
+        int expected_feedback = 0;
+        bool expected_history = false;
+        int external_count = 0;
+        int constant_count = 0;
+        for (const auto &binding : loaded_cfg.exec_cfg.model_io.inputs) {
+            expected_feedback += binding.source == ModelInputSource::FEEDBACK ? 1 : 0;
+            expected_history = expected_history ||
+                binding.source == ModelInputSource::OBSERVATION_HISTORY;
+            external_count += binding.source == ModelInputSource::EXTERNAL ? 1 : 0;
+            constant_count += binding.source == ModelInputSource::CONSTANT ? 1 : 0;
+        }
+        const int expose_count = static_cast<int>(std::count_if(
+            loaded_cfg.exec_cfg.model_io.outputs.begin(),
+            loaded_cfg.exec_cfg.model_io.outputs.end(),
+            [](const auto &binding) {
+                return binding.target == ModelOutputTarget::EXPOSE;
+            }));
+        const int ignore_count = static_cast<int>(std::count_if(
+            loaded_cfg.exec_cfg.model_io.outputs.begin(),
+            loaded_cfg.exec_cfg.model_io.outputs.end(),
+            [](const auto &binding) {
+                return binding.target == ModelOutputTarget::IGNORE;
+            }));
+
+        Require(policy.ObsDim() > 0, "观测维度必须大于 0");
+        Require(policy.ActionDim() > 0, "动作维度必须大于 0");
+        Require(
+            policy.FeedbackStateCount() == expected_feedback,
+            "FeedbackStateCount 与 model_io 不一致");
+        Require(policy.HasObsHist() == expected_history, "HasObsHist 与 model_io 不一致");
+        std::cout << "  model_io: external=" << external_count
+                << ", constant=" << constant_count
+                << ", expose=" << expose_count
+                << ", ignore=" << ignore_count << "\n";
+
+        RequireThrows(
+            [&] { policy.SetModelInput("__missing__", &invalid_input, 1); },
+            "不存在的 external 输入 key");
+        RequireThrows(
+            [&] {
+                policy.SetModelInput(
+                    "__missing__", rl_policy::MakeTensorView(&invalid_input, 1));
+            },
+            "不存在的原生 external 输入 key");
+        RequireThrows(
+            [&] { policy.GetModelOutput("__missing__"); },
+            "不存在的 expose 输出 key");
+        RequireThrows(
+            [&] { policy.GetModelOutputTensor("__missing__"); },
+            "不存在的原生 expose 输出 key");
+
+        for (const auto &binding : loaded_cfg.exec_cfg.model_io.inputs) {
+            if (binding.source != ModelInputSource::EXTERNAL ||
+                binding.initial_value.size() <= 1) {
+                continue;
+            }
+            // 单值 default 允许由执行器广播，不能当作完整的运行时 payload 重注入。
+            policy.SetModelInput(
+                InputKey(binding),
+                binding.initial_value.data(),
+                static_cast<int>(binding.initial_value.size()));
+        }
+        for (const auto &binding : loaded_cfg.exec_cfg.model_io.outputs) {
+            if (binding.target != ModelOutputTarget::EXPOSE) continue;
+            const std::string key = OutputKey(binding);
+            RequireThrows(
+                [&] { policy.GetModelOutputTensor(key); },
+                "首次推理前读取 expose 输出: " + key);
+        }
 
         policy.PrintModelInfo();
         if (!loaded_cfg.exec_cfg.custom_scalar_defaults.empty()) {
@@ -97,7 +271,7 @@ int main(int argc, char *argv[]) {
         std::array<double, 4> base_quat = {1.0, 0.0, 0.0, 0.0};  // 单位四元数
         std::array<double, 3> base_vel = {0.0, 0.0, 0.0};
 
-        // 循环 5 帧演示推理过程（特别是 LSTM 模型的状态维护）
+        // 循环 5 帧演示推理过程（包括 feedback/history 状态维护）
         std::cout << "  执行 5 帧推理循环...\n";
         for (int frame = 0; frame < 5; ++frame) {
             // 模拟传感器数据变化
@@ -121,6 +295,8 @@ int main(int argc, char *argv[]) {
             // 推理
             std::vector<double> action;
             policy.Infer(obs, action);
+            ValidateActionClip(action, loaded_cfg.exec_cfg.clip_actions);
+            ValidateExposedOutputs(policy, loaded_cfg.exec_cfg.model_io);
 
             // 动作映射
             std::vector<double> target_pos;
@@ -147,6 +323,8 @@ int main(int argc, char *argv[]) {
 
         std::vector<double> action;
         policy.Infer(obs, action);
+        ValidateActionClip(action, loaded_cfg.exec_cfg.clip_actions);
+        ValidateExposedOutputs(policy, loaded_cfg.exec_cfg.model_io);
         std::cout << "  动作输出维度: " << action.size() << " (期望: " << policy.ActionDim()
                 << ")\n";
         if (action.size() != policy.ActionDim()) {

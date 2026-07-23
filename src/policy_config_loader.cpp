@@ -11,6 +11,8 @@
 #include <filesystem>  // NOLINT(build/c++17)
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "rl_service.h"
 
@@ -22,6 +24,44 @@ namespace fs = std::filesystem;
 template <typename T>
 T NodeAs(const YAML::Node &node, const T &fallback) {
     return node ? node.as<T>() : fallback;
+}
+
+ModelInputSource ParseInputSource(const YAML::Node &node) {
+    if (!node || !node.IsScalar()) {
+        throw std::runtime_error("[PolicyConfigLoader] model_io input 缺少 source");
+    }
+    const std::string value = node.as<std::string>();
+    if (value == "observation") return ModelInputSource::OBSERVATION;
+    if (value == "observation_history") return ModelInputSource::OBSERVATION_HISTORY;
+    if (value == "feedback") return ModelInputSource::FEEDBACK;
+    if (value == "constant") return ModelInputSource::CONSTANT;
+    if (value == "external") return ModelInputSource::EXTERNAL;
+    throw std::runtime_error("[PolicyConfigLoader] 未知 model_io input source: " + value);
+}
+
+ModelOutputTarget ParseOutputTarget(const YAML::Node &node) {
+    if (!node || !node.IsScalar()) {
+        throw std::runtime_error("[PolicyConfigLoader] model_io output 缺少 target");
+    }
+    const std::string value = node.as<std::string>();
+    if (value == "action") return ModelOutputTarget::ACTION;
+    if (value == "expose") return ModelOutputTarget::EXPOSE;
+    if (value == "ignore") return ModelOutputTarget::IGNORE;
+    throw std::runtime_error("[PolicyConfigLoader] 未知 model_io output target: " + value);
+}
+
+std::vector<float> ParseFloatValues(const YAML::Node &node, const std::string &field) {
+    if (!node) return {};
+    if (node.IsSequence()) return node.as<std::vector<float>>();
+    if (node.IsScalar()) return {node.as<float>()};
+    throw std::runtime_error("[PolicyConfigLoader] " + field + " 必须是数值或数值序列");
+}
+
+std::vector<double> ParseDoubleValues(const YAML::Node &node, const std::string &field) {
+    if (!node) return {};
+    if (node.IsSequence()) return node.as<std::vector<double>>();
+    if (node.IsScalar()) return {node.as<double>()};
+    throw std::runtime_error("[PolicyConfigLoader] " + field + " 必须是数值或数值序列");
 }
 
 }  // namespace
@@ -83,6 +123,56 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
         throw std::runtime_error("[PolicyConfigLoader] 策略 '" + policy_name +
                                 "' 缺少 rl_default_pos 配置");
     }
+
+    const auto model_io = policy["model_io"];
+    if (!model_io || !model_io.IsMap()) {
+        throw std::runtime_error("[PolicyConfigLoader] 策略 '" + policy_name +
+                                "' 缺少 model_io map");
+    }
+    const auto inputs = model_io["inputs"];
+    const auto outputs = model_io["outputs"];
+    if (!inputs || !inputs.IsSequence() || inputs.size() == 0 ||
+        !outputs || !outputs.IsSequence() || outputs.size() == 0) {
+        throw std::runtime_error(
+            "[PolicyConfigLoader] model_io 必须包含非空 inputs 和 outputs 序列");
+    }
+
+    for (const auto &node : inputs) {
+        if (!node.IsMap() || !node["name"]) {
+            throw std::runtime_error("[PolicyConfigLoader] model_io input 缺少 name");
+        }
+        ModelInputBindingConfig binding;
+        binding.name = node["name"].as<std::string>();
+        binding.source = ParseInputSource(node["source"]);
+        binding.key = NodeAs(node["key"], std::string{});
+        binding.feedback_output = NodeAs(node["output"], std::string{});
+        binding.history_source = NodeAs(node["history_of"], std::string{});
+        binding.observation_offset = NodeAs(node["offset"], -1);
+        if (node["value"] && node["default"]) {
+            throw std::runtime_error(
+                "[PolicyConfigLoader] model_io input 不能同时配置 value 和 default: " +
+                binding.name);
+        }
+        const auto initial = node["value"] ? node["value"] : node["default"];
+        binding.initial_value = ParseFloatValues(initial, "model_io input value/default");
+        out.exec_cfg.model_io.inputs.push_back(std::move(binding));
+    }
+
+    for (const auto &node : outputs) {
+        if (!node.IsMap() || !node["name"]) {
+            throw std::runtime_error("[PolicyConfigLoader] model_io output 缺少 name");
+        }
+        ModelOutputBindingConfig binding;
+        binding.name = node["name"].as<std::string>();
+        binding.target = ParseOutputTarget(node["target"]);
+        binding.key = NodeAs(node["key"], std::string{});
+        out.exec_cfg.model_io.outputs.push_back(std::move(binding));
+    }
+
+    out.exec_cfg.clip_observations =
+        ParseDoubleValues(policy["clip_observations"], "clip_observations");
+    out.exec_cfg.clip_actions =
+        ParseDoubleValues(policy["clip_actions"], "clip_actions");
 
     const auto obs = policy["observation"];
     if (obs) {

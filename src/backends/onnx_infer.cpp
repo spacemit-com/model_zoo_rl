@@ -3,17 +3,22 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file onnx_infer.cpp
- * @brief ONNX Runtime 推理实现
+ * @brief ONNX Runtime inference backend implementation
  */
 
 #include "onnx_infer.h"
 
 #include <onnxruntime_cxx_api.h>
 
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
-#include <numeric>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -21,25 +26,324 @@
 #if defined(cpu_rv64) || defined(__riscv)
 #include "spacemit_ort_env.h"
 #endif
+
 namespace onnx_runtime {
+namespace {
+
+static_assert(
+    static_cast<int>(TensorElementType::FLOAT32) == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT);
+static_assert(
+    static_cast<int>(TensorElementType::BFLOAT16) == ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16);
+
+struct TensorTypeTraits {
+    const char *name;
+    std::size_t bits_per_element;
+    bool supports_float_conversion;
+};
+
+constexpr std::array<TensorTypeTraits, 23> kTensorTypeTraits = {{
+    {"undefined", 0, false},
+    {"float32", 32, true},
+    {"uint8", 8, true},
+    {"int8", 8, true},
+    {"uint16", 16, true},
+    {"int16", 16, true},
+    {"int32", 32, true},
+    {"int64", 64, true},
+    {"string", 0, false},
+    {"bool", 8, true},
+    {"float16", 16, true},
+    {"float64", 64, true},
+    {"uint32", 32, true},
+    {"uint64", 64, true},
+    {"complex64", 64, false},
+    {"complex128", 128, false},
+    {"bfloat16", 16, true},
+    {"float8e4m3fn", 8, false},
+    {"float8e4m3fnuz", 8, false},
+    {"float8e5m2", 8, false},
+    {"float8e5m2fnuz", 8, false},
+    {"uint4", 4, false},
+    {"int4", 4, false},
+}};
+
+static_assert(
+    kTensorTypeTraits.size() == static_cast<std::size_t>(TensorElementType::INT4) + 1);
+
+const TensorTypeTraits &GetTensorTypeTraits(TensorElementType type) {
+    const int index = static_cast<int>(type);
+    if (index < 0 || static_cast<std::size_t>(index) >= kTensorTypeTraits.size()) {
+        return kTensorTypeTraits.front();
+    }
+    return kTensorTypeTraits[static_cast<std::size_t>(index)];
+}
+
+TensorElementType FromOnnxType(ONNXTensorElementDataType type) {
+    return static_cast<TensorElementType>(static_cast<int>(type));
+}
+
+ONNXTensorElementDataType ToOnnxType(TensorElementType type) {
+    return static_cast<ONNXTensorElementDataType>(static_cast<int>(type));
+}
+
+const char *TensorElementTypeName(TensorElementType type) {
+    return GetTensorTypeTraits(type).name;
+}
+
+bool SupportsFloatConversion(TensorElementType type) {
+    return GetTensorTypeTraits(type).supports_float_conversion;
+}
+
+std::size_t TensorByteCount(TensorElementType type, std::size_t element_count) {
+    const auto &traits = GetTensorTypeTraits(type);
+    if (traits.bits_per_element == 0) {
+        throw std::runtime_error(
+            std::string("unsupported tensor dtype: ") + traits.name);
+    }
+    if (traits.bits_per_element == 4) {
+        return (element_count + 1) / 2;
+    }
+    return element_count * (traits.bits_per_element / 8);
+}
+
+template <typename T>
+T ConvertInteger(float value, const std::string &tensor_name, std::size_t index) {
+    if (!std::isfinite(value)) {
+        throw std::runtime_error(
+            "tensor " + tensor_name + " contains non-finite integer value at index " +
+            std::to_string(index));
+    }
+    const long double rounded = std::round(static_cast<long double>(value));
+    if (rounded < static_cast<long double>(std::numeric_limits<T>::lowest()) ||
+        rounded > static_cast<long double>(std::numeric_limits<T>::max())) {
+        throw std::runtime_error(
+            "tensor " + tensor_name + " integer value out of range at index " +
+            std::to_string(index));
+    }
+    return static_cast<T>(rounded);
+}
+
+template <typename T>
+void AssignIntegers(
+    const float *source, T *target, std::size_t count, const std::string &tensor_name) {
+    for (std::size_t i = 0; i < count; ++i) {
+        target[i] = ConvertInteger<T>(source[i], tensor_name, i);
+    }
+}
+
+template <typename T>
+void CopyNumbersToFloat(const T *source, std::size_t count, std::vector<float> &target) {
+    target.resize(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        target[i] = static_cast<float>(source[i]);
+    }
+}
+
+void AssignFromFloat(
+    Ort::Value &tensor,
+    TensorElementType type,
+    const float *source,
+    std::size_t element_count,
+    const std::string &tensor_name) {
+    if (!source) {
+        throw std::runtime_error("tensor " + tensor_name + " data is null");
+    }
+    void *raw = tensor.GetTensorMutableRawData();
+    switch (type) {
+    case TensorElementType::FLOAT32:
+        std::memcpy(raw, source, element_count * sizeof(float));
+        return;
+    case TensorElementType::FLOAT64: {
+        auto *target = static_cast<double *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) target[i] = source[i];
+        return;
+    }
+    case TensorElementType::UINT8:
+        AssignIntegers(source, static_cast<std::uint8_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::INT8:
+        AssignIntegers(source, static_cast<std::int8_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::UINT16:
+        AssignIntegers(source, static_cast<std::uint16_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::INT16:
+        AssignIntegers(source, static_cast<std::int16_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::UINT32:
+        AssignIntegers(source, static_cast<std::uint32_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::INT32:
+        AssignIntegers(source, static_cast<std::int32_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::UINT64:
+        AssignIntegers(source, static_cast<std::uint64_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::INT64:
+        AssignIntegers(source, static_cast<std::int64_t *>(raw), element_count, tensor_name);
+        return;
+    case TensorElementType::BOOL: {
+        auto *target = static_cast<bool *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) {
+            if (!std::isfinite(source[i])) {
+                throw std::runtime_error(
+                    "tensor " + tensor_name + " contains non-finite bool value at index " +
+                    std::to_string(i));
+            }
+            target[i] = source[i] != 0.0f;
+        }
+        return;
+    }
+    case TensorElementType::FLOAT16: {
+        auto *target = static_cast<std::uint16_t *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) {
+            target[i] = Ort::Float16_t(source[i]).val;
+        }
+        return;
+    }
+    case TensorElementType::BFLOAT16: {
+        auto *target = static_cast<std::uint16_t *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) {
+            target[i] = Ort::BFloat16_t(source[i]).val;
+        }
+        return;
+    }
+    default:
+        throw std::runtime_error(
+            "tensor " + tensor_name + " requires native " +
+            TensorElementTypeName(type) + " input data");
+    }
+}
+
+void CopyToFloat(
+    const Ort::Value &tensor,
+    TensorElementType type,
+    std::size_t element_count,
+    std::vector<float> &target,
+    const std::string &tensor_name) {
+    const void *raw = tensor.GetTensorRawData();
+    switch (type) {
+    case TensorElementType::FLOAT32:
+        target.resize(element_count);
+        std::memcpy(target.data(), raw, element_count * sizeof(float));
+        return;
+    case TensorElementType::FLOAT64:
+        CopyNumbersToFloat(
+            static_cast<const double *>(raw), element_count, target);
+        return;
+    case TensorElementType::UINT8:
+        CopyNumbersToFloat(
+            static_cast<const std::uint8_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::INT8:
+        CopyNumbersToFloat(
+            static_cast<const std::int8_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::UINT16:
+        CopyNumbersToFloat(
+            static_cast<const std::uint16_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::INT16:
+        CopyNumbersToFloat(
+            static_cast<const std::int16_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::UINT32:
+        CopyNumbersToFloat(
+            static_cast<const std::uint32_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::INT32:
+        CopyNumbersToFloat(
+            static_cast<const std::int32_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::UINT64:
+        CopyNumbersToFloat(
+            static_cast<const std::uint64_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::INT64:
+        CopyNumbersToFloat(
+            static_cast<const std::int64_t *>(raw), element_count, target);
+        return;
+    case TensorElementType::BOOL: {
+        target.resize(element_count);
+        const auto *source = static_cast<const bool *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) {
+            target[i] = source[i] ? 1.0f : 0.0f;
+        }
+        return;
+    }
+    case TensorElementType::FLOAT16: {
+        target.resize(element_count);
+        const auto *source = static_cast<const std::uint16_t *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) {
+            target[i] = Ort::Float16_t::FromBits(source[i]).ToFloat();
+        }
+        return;
+    }
+    case TensorElementType::BFLOAT16: {
+        target.resize(element_count);
+        const auto *source = static_cast<const std::uint16_t *>(raw);
+        for (std::size_t i = 0; i < element_count; ++i) {
+            target[i] = Ort::BFloat16_t::FromBits(source[i]).ToFloat();
+        }
+        return;
+    }
+    default:
+        throw std::runtime_error(
+            "tensor " + tensor_name + " cannot be represented as float: " +
+            TensorElementTypeName(type));
+    }
+}
+
+std::vector<int64_t> ResolveShape(const std::vector<int64_t> &shape) {
+    std::vector<int64_t> resolved = shape;
+    for (auto &dim : resolved) {
+        if (dim <= 0) dim = 1;
+    }
+    return resolved;
+}
+
+int64_t ComputeTensorSize(const std::vector<int64_t> &shape) {
+    int64_t size = 1;
+    for (const auto dim : shape) size *= dim;
+    return size;
+}
+
+Ort::Value CreateOwnedTensor(
+    Ort::AllocatorWithDefaultOptions &allocator, const TensorInfo &info) {
+    TensorByteCount(info.element_type, static_cast<std::size_t>(info.total_size));
+    return Ort::Value::CreateTensor(
+        allocator,
+        info.shape.data(),
+        info.shape.size(),
+        ToOnnxType(info.element_type));
+}
+
+void ZeroTensor(Ort::Value &tensor, const TensorInfo &info) {
+    const auto byte_count =
+        TensorByteCount(info.element_type, static_cast<std::size_t>(info.total_size));
+    if (byte_count > 0) {
+        std::memset(tensor.GetTensorMutableRawData(), 0, byte_count);
+    }
+}
+
+}  // namespace
 
 class OnnxRuntimeClass::ImpClass {
 public:
     explicit ImpClass(OnnxRuntimeClass *omp);
     ~ImpClass();
     bool Init(const std::string &model_file);
-    void Step();
+    bool Step();
 
     OnnxRuntimeClass &omp;
-
-    // ONNX Runtime相关成员
     Ort::Env env;
     Ort::SessionOptions session_options;
     std::unique_ptr<Ort::Session> session;
     Ort::AllocatorWithDefaultOptions allocator;
+    std::vector<Ort::Value> inputs;
+    std::vector<Ort::Value> outputs;
 };
 
-// ImpClass构造函数
 OnnxRuntimeClass::ImpClass::ImpClass(OnnxRuntimeClass *omp)
     : omp(*omp), env(ORT_LOGGING_LEVEL_WARNING, "OnnxRuntime") {
     std::cout << "[ONNX Runtime] ImpClass 构造" << std::endl;
@@ -49,196 +353,157 @@ OnnxRuntimeClass::ImpClass::~ImpClass() {
     std::cout << "[ONNX Runtime] ImpClass 析构" << std::endl;
 }
 
-// 解析动态维度（负值→1），返回解析后的 shape
-static std::vector<int64_t> ResolveShape(const std::vector<int64_t> &shape) {
-    std::vector<int64_t> resolved = shape;
-    for (auto &dim : resolved) {
-        if (dim <= 0)
-            dim = 1;  // 动态维度默认为1
-    }
-    return resolved;
-}
-
-// 计算张量总元素数
-static int64_t ComputeTensorSize(const std::vector<int64_t> &shape) {
-    if (shape.empty())
-        return 0;
-    int64_t size = 1;
-    for (auto dim : shape) {
-        size *= dim;
-    }
-    return size;
-}
-
-// ImpClass::Init函数 - 自动推断版本
 bool OnnxRuntimeClass::ImpClass::Init(const std::string &model_file) {
     std::cout << "[ONNX Runtime] 开始初始化模型: " << model_file << std::endl;
 
     try {
-        // 设置会话选项
 #if defined(cpu_rv64) || defined(__riscv)
-        SessionOptionsSpaceMITEnvInit(session_options);  // 可选：SpaceMIT 专属 EP
+        SessionOptionsSpaceMITEnvInit(session_options);
 #endif
-
         session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
         session_options.SetIntraOpNumThreads(1);
         session_options.SetInterOpNumThreads(1);
 
-        // 加载模型
-        session = std::make_unique<Ort::Session>(env, model_file.c_str(), session_options);
+        auto next_session =
+            std::make_unique<Ort::Session>(env, model_file.c_str(), session_options);
         std::cout << "[ONNX Runtime] 模型加载成功" << std::endl;
 
-        // ============================================================
-        // 自动推断输入信息
-        // ============================================================
-        size_t input_count = session->GetInputCount();
+        const std::size_t input_count = next_session->GetInputCount();
         std::cout << "[ONNX Runtime] 检测到 " << input_count << " 个输入" << std::endl;
+        std::vector<TensorInfo> next_input_infos(input_count);
+        std::vector<Ort::Value> next_inputs;
+        next_inputs.reserve(input_count);
 
-        omp.input_infos_.resize(input_count);
-        omp.inputs_.resize(input_count);
-
-        for (size_t i = 0; i < input_count; ++i) {
-            // 获取输入名称
-            auto input_name = session->GetInputNameAllocated(i, allocator);
-            omp.input_infos_[i].name = input_name.get();
-
-            // 获取输入维度并解析动态维度
-            auto type_info = session->GetInputTypeInfo(i);
+        for (std::size_t i = 0; i < input_count; ++i) {
+            auto input_name = next_session->GetInputNameAllocated(i, allocator);
+            auto type_info = next_session->GetInputTypeInfo(i);
             auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-            omp.input_infos_[i].shape = ResolveShape(tensor_info.GetShape());
+            auto &info = next_input_infos[i];
+            info.name = input_name.get();
+            info.shape = ResolveShape(tensor_info.GetShape());
+            info.total_size = ComputeTensorSize(info.shape);
+            info.element_type = FromOnnxType(tensor_info.GetElementType());
+            info.element_type_name = TensorElementTypeName(info.element_type);
+            next_inputs.push_back(CreateOwnedTensor(allocator, info));
+            ZeroTensor(next_inputs.back(), info);
 
-            // 计算总元素数
-            omp.input_infos_[i].total_size = ComputeTensorSize(omp.input_infos_[i].shape);
-
-            // 初始化输入向量
-            omp.inputs_[i].setZero(omp.input_infos_[i].total_size);
-
-            // 建立名称到索引的映射
-            omp.input_name_to_index_[omp.input_infos_[i].name] = i;
-
-            std::cout << "  输入[" << i << "]: " << omp.input_infos_[i].name << ", shape=[";
-            for (size_t j = 0; j < omp.input_infos_[i].shape.size(); ++j) {
-                std::cout << omp.input_infos_[i].shape[j];
-                if (j < omp.input_infos_[i].shape.size() - 1)
-                    std::cout << ", ";
+            std::cout << "  输入[" << i << "]: " << info.name << ", shape=[";
+            for (std::size_t j = 0; j < info.shape.size(); ++j) {
+                std::cout << info.shape[j];
+                if (j + 1 < info.shape.size()) std::cout << ", ";
             }
-            std::cout << "], total_size=" << omp.input_infos_[i].total_size << std::endl;
+            std::cout << "], dtype=" << info.element_type_name
+                    << ", total_size=" << info.total_size << std::endl;
         }
 
-        // ============================================================
-        // 自动推断输出信息
-        // ============================================================
-        size_t output_count = session->GetOutputCount();
+        const std::size_t output_count = next_session->GetOutputCount();
         std::cout << "[ONNX Runtime] 检测到 " << output_count << " 个输出" << std::endl;
+        std::vector<TensorInfo> next_output_infos(output_count);
 
-        omp.output_infos_.resize(output_count);
-        omp.outputs_.resize(output_count);
-
-        for (size_t i = 0; i < output_count; ++i) {
-            // 获取输出名称
-            auto output_name = session->GetOutputNameAllocated(i, allocator);
-            omp.output_infos_[i].name = output_name.get();
-
-            // 获取输出维度并解析动态维度
-            auto type_info = session->GetOutputTypeInfo(i);
+        for (std::size_t i = 0; i < output_count; ++i) {
+            auto output_name = next_session->GetOutputNameAllocated(i, allocator);
+            auto type_info = next_session->GetOutputTypeInfo(i);
             auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-            omp.output_infos_[i].shape = ResolveShape(tensor_info.GetShape());
+            auto &info = next_output_infos[i];
+            info.name = output_name.get();
+            info.shape = ResolveShape(tensor_info.GetShape());
+            info.total_size = ComputeTensorSize(info.shape);
+            info.element_type = FromOnnxType(tensor_info.GetElementType());
+            info.element_type_name = TensorElementTypeName(info.element_type);
 
-            // 计算总元素数
-            omp.output_infos_[i].total_size = ComputeTensorSize(omp.output_infos_[i].shape);
-
-            // 初始化输出向量
-            omp.outputs_[i].setZero(omp.output_infos_[i].total_size);
-
-            // 建立名称到索引的映射
-            omp.output_name_to_index_[omp.output_infos_[i].name] = i;
-
-            std::cout << "  输出[" << i << "]: " << omp.output_infos_[i].name << ", shape=[";
-            for (size_t j = 0; j < omp.output_infos_[i].shape.size(); ++j) {
-                std::cout << omp.output_infos_[i].shape[j];
-                if (j < omp.output_infos_[i].shape.size() - 1)
-                    std::cout << ", ";
+            std::cout << "  输出[" << i << "]: " << info.name << ", shape=[";
+            for (std::size_t j = 0; j < info.shape.size(); ++j) {
+                std::cout << info.shape[j];
+                if (j + 1 < info.shape.size()) std::cout << ", ";
             }
-            std::cout << "], total_size=" << omp.output_infos_[i].total_size << std::endl;
+            std::cout << "], dtype=" << info.element_type_name
+                    << ", total_size=" << info.total_size << std::endl;
         }
 
+        session = std::move(next_session);
+        inputs = std::move(next_inputs);
+        outputs.clear();
+        omp.input_infos_ = std::move(next_input_infos);
+        omp.output_infos_ = std::move(next_output_infos);
+        omp.output_float_views_.clear();
+        omp.output_float_views_.resize(output_count);
+        omp.last_error_.clear();
         std::cout << "[ONNX Runtime] 初始化完成" << std::endl;
         return true;
     } catch (const Ort::Exception &e) {
+        omp.last_error_ = e.what();
         std::cerr << "[ONNX Runtime] 初始化错误: " << e.what() << std::endl;
         return false;
     } catch (const std::exception &e) {
+        omp.last_error_ = e.what();
         std::cerr << "[ONNX Runtime] 初始化异常: " << e.what() << std::endl;
         return false;
     }
 }
 
-// ImpClass::Step函数 - 通用推理
-void OnnxRuntimeClass::ImpClass::Step() {
+bool OnnxRuntimeClass::ImpClass::Step() {
+    omp.outputs_valid_ = false;
     if (!session) {
-        std::cerr << "[ONNX Runtime] 错误: 会话未初始化" << std::endl;
-        return;
+        omp.last_error_ = "会话未初始化";
+        std::cerr << "[ONNX Runtime] 错误: " << omp.last_error_ << std::endl;
+        return false;
     }
 
     try {
-        // 准备输入张量
-        std::vector<Ort::Value> input_tensors;
         std::vector<const char *> input_names;
-        Ort::MemoryInfo memory_info =
-            Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+        input_names.reserve(omp.input_infos_.size());
+        for (const auto &info : omp.input_infos_) input_names.push_back(info.name.c_str());
 
-        for (size_t i = 0; i < omp.inputs_.size(); ++i) {
-            input_names.push_back(omp.input_infos_[i].name.c_str());
-
-            Ort::Value tensor = Ort::Value::CreateTensor<float>(memory_info,
-                                                                omp.inputs_[i].data(),
-                                                                omp.input_infos_[i].total_size,
-                                                                omp.input_infos_[i].shape.data(),
-                                                                omp.input_infos_[i].shape.size());
-            input_tensors.push_back(std::move(tensor));
-        }
-
-        // 准备输出名称
         std::vector<const char *> output_names;
-        for (size_t i = 0; i < omp.outputs_.size(); ++i) {
-            output_names.push_back(omp.output_infos_[i].name.c_str());
-        }
+        output_names.reserve(omp.output_infos_.size());
+        for (const auto &info : omp.output_infos_) output_names.push_back(info.name.c_str());
 
-        // 执行推理
         Ort::RunOptions run_options;
-        auto output_tensors = session->Run(run_options,
-                                            input_names.data(),
-                                            input_tensors.data(),
-                                            input_tensors.size(),
-                                            output_names.data(),
-                                            output_names.size());
+        auto next_outputs = session->Run(
+            run_options,
+            input_names.data(),
+            inputs.data(),
+            inputs.size(),
+            output_names.data(),
+            output_names.size());
 
-        // 拷贝输出数据
-        for (size_t i = 0; i < output_tensors.size(); ++i) {
-            if (output_tensors[i].IsTensor()) {
-                float *output_data = output_tensors[i].GetTensorMutableData<float>();
-                std::memcpy(omp.outputs_[i].data(),
-                            output_data,
-                            omp.output_infos_[i].total_size * sizeof(float));
-            } else {
-                std::cerr << "[ONNX Runtime] 警告: 输出[" << i << "] 不是张量" << std::endl;
-                omp.outputs_[i].setZero();
+        if (next_outputs.size() != omp.output_infos_.size()) {
+            throw std::runtime_error("ONNX output count changed at runtime");
+        }
+        for (std::size_t i = 0; i < next_outputs.size(); ++i) {
+            if (!next_outputs[i].IsTensor()) {
+                throw std::runtime_error(
+                    "output " + omp.output_infos_[i].name + " is not a tensor");
+            }
+            const auto actual_info = next_outputs[i].GetTensorTypeAndShapeInfo();
+            const auto actual_type = FromOnnxType(actual_info.GetElementType());
+            const auto &expected = omp.output_infos_[i];
+            if (actual_type != expected.element_type) {
+                throw std::runtime_error(
+                    "tensor " + expected.name + " output dtype changed from " +
+                    expected.element_type_name + " to " + TensorElementTypeName(actual_type));
+            }
+            if (actual_info.GetElementCount() != static_cast<std::size_t>(expected.total_size)) {
+                throw std::runtime_error(
+                    "tensor " + expected.name + " output size changed at runtime");
             }
         }
+
+        outputs = std::move(next_outputs);
+        omp.outputs_valid_ = true;
+        omp.last_error_.clear();
+        return true;
     } catch (const Ort::Exception &e) {
+        omp.last_error_ = e.what();
         std::cerr << "[ONNX Runtime] 推理错误: " << e.what() << std::endl;
-        for (auto &output : omp.outputs_) {
-            output.setZero();
-        }
     } catch (const std::exception &e) {
+        omp.last_error_ = e.what();
         std::cerr << "[ONNX Runtime] 推理异常: " << e.what() << std::endl;
-        for (auto &output : omp.outputs_) {
-            output.setZero();
-        }
     }
+
+    return false;
 }
 
-// OnnxRuntimeClass 公共接口实现
 OnnxRuntimeClass::OnnxRuntimeClass() : imp_(std::make_unique<ImpClass>(this)) {
     std::cout << "[ONNX Runtime] OnnxRuntimeClass 构造" << std::endl;
 }
@@ -248,28 +513,40 @@ OnnxRuntimeClass::~OnnxRuntimeClass() {
 }
 
 bool OnnxRuntimeClass::Init(const std::string &model_file) {
+    outputs_valid_ = false;
     if (!imp_) {
-        std::cerr << "[ONNX Runtime] 错误: ImpClass 未初始化" << std::endl;
+        last_error_ = "ImpClass 未初始化";
+        std::cerr << "[ONNX Runtime] 错误: " << last_error_ << std::endl;
         return false;
     }
     return imp_->Init(model_file);
 }
 
-void OnnxRuntimeClass::Run() {
+bool OnnxRuntimeClass::Run() {
     if (!imp_) {
-        std::cerr << "[ONNX Runtime] 错误: ImpClass 未初始化" << std::endl;
-        return;
+        last_error_ = "ImpClass 未初始化";
+        std::cerr << "[ONNX Runtime] 错误: " << last_error_ << std::endl;
+        return false;
     }
-    imp_->Step();
+    return imp_->Step();
 }
 
-// 获取模型信息
+const std::string &OnnxRuntimeClass::GetLastError() const {
+    return last_error_;
+}
+
+void OnnxRuntimeClass::EnsureOutputsValid() const {
+    if (!outputs_valid_) {
+        throw std::runtime_error("ONNX outputs are unavailable until Run() succeeds");
+    }
+}
+
 int OnnxRuntimeClass::GetInputCount() const {
-    return static_cast<int>(inputs_.size());
+    return static_cast<int>(input_infos_.size());
 }
 
 int OnnxRuntimeClass::GetOutputCount() const {
-    return static_cast<int>(outputs_.size());
+    return static_cast<int>(output_infos_.size());
 }
 
 const TensorInfo &OnnxRuntimeClass::GetInputInfo(int index) const {
@@ -280,57 +557,114 @@ const TensorInfo &OnnxRuntimeClass::GetOutputInfo(int index) const {
     return output_infos_.at(index);
 }
 
-// 通过索引访问
-vecXf &OnnxRuntimeClass::GetInput(int index) {
-    return inputs_.at(index);
-}
-
-vecXf &OnnxRuntimeClass::GetOutput(int index) {
-    return outputs_.at(index);
-}
-
-// 通过名称访问
-vecXf &OnnxRuntimeClass::GetInput(const std::string &name) {
-    auto it = input_name_to_index_.find(name);
-    if (it == input_name_to_index_.end()) {
-        throw std::runtime_error("[ONNX Runtime] 输入名称不存在: " + name);
+void OnnxRuntimeClass::SetInputFromFloat(
+    int index, const float *data, std::size_t element_count) {
+    const auto &info = input_infos_.at(index);
+    if (element_count != static_cast<std::size_t>(info.total_size)) {
+        throw std::runtime_error("tensor " + info.name + " input size mismatch");
     }
-    return inputs_[it->second];
+    AssignFromFloat(
+        imp_->inputs.at(index), info.element_type, data, element_count, info.name);
 }
 
-vecXf &OnnxRuntimeClass::GetOutput(const std::string &name) {
-    auto it = output_name_to_index_.find(name);
-    if (it == output_name_to_index_.end()) {
-        throw std::runtime_error("[ONNX Runtime] 输出名称不存在: " + name);
+bool OnnxRuntimeClass::CanSetInputFromFloat(int index) const {
+    return SupportsFloatConversion(input_infos_.at(index).element_type);
+}
+
+void OnnxRuntimeClass::SetInput(int index, const TensorView &input) {
+    const auto &info = input_infos_.at(index);
+    const auto expected_count = static_cast<std::size_t>(info.total_size);
+    const auto expected_bytes = TensorByteCount(info.element_type, expected_count);
+    if (input.element_type != info.element_type) {
+        throw std::runtime_error(
+            "tensor " + info.name + " dtype mismatch: actual=" +
+            TensorElementTypeName(input.element_type) + ", expected=" +
+            info.element_type_name);
     }
-    return outputs_[it->second];
+    if (input.element_count != expected_count || input.byte_count != expected_bytes) {
+        throw std::runtime_error("tensor " + info.name + " buffer size mismatch");
+    }
+    if (expected_bytes > 0 && !input.data) {
+        throw std::runtime_error("tensor " + info.name + " data is null");
+    }
+    if (expected_bytes > 0) {
+        std::memcpy(
+            imp_->inputs.at(index).GetTensorMutableRawData(), input.data, expected_bytes);
+    }
 }
 
-// 打印模型信息
+const std::vector<float> &OnnxRuntimeClass::GetOutput(int index) const {
+    EnsureOutputsValid();
+    const auto &info = output_infos_.at(index);
+    auto &target = output_float_views_.at(index);
+    CopyToFloat(
+        imp_->outputs.at(index),
+        info.element_type,
+        static_cast<std::size_t>(info.total_size),
+        target,
+        info.name);
+    return target;
+}
+
+bool OnnxRuntimeClass::CanGetOutputAsFloat(int index) const {
+    return SupportsFloatConversion(output_infos_.at(index).element_type);
+}
+
+TensorView OnnxRuntimeClass::GetOutputView(int index) const {
+    EnsureOutputsValid();
+    const auto &info = output_infos_.at(index);
+    const auto element_count = static_cast<std::size_t>(info.total_size);
+    return {
+        info.element_type,
+        imp_->outputs.at(index).GetTensorRawData(),
+        element_count,
+        TensorByteCount(info.element_type, element_count),
+    };
+}
+
+void OnnxRuntimeClass::CopyOutputToInput(int output_index, int input_index) {
+    EnsureOutputsValid();
+    const auto &output_info = output_infos_.at(output_index);
+    const auto &input_info = input_infos_.at(input_index);
+    if (output_info.element_type != input_info.element_type ||
+        output_info.total_size != input_info.total_size) {
+        throw std::runtime_error(
+            "feedback tensor mismatch: " + input_info.name + " <- " + output_info.name);
+    }
+    const auto byte_count = TensorByteCount(
+        input_info.element_type, static_cast<std::size_t>(input_info.total_size));
+    if (byte_count > 0) {
+        std::memcpy(
+            imp_->inputs.at(input_index).GetTensorMutableRawData(),
+            imp_->outputs.at(output_index).GetTensorRawData(),
+            byte_count);
+    }
+}
+
 void OnnxRuntimeClass::PrintModelInfo() const {
     std::cout << "\n========== ONNX 模型信息 ==========" << std::endl;
     std::cout << "输入数量: " << GetInputCount() << std::endl;
     for (int i = 0; i < GetInputCount(); ++i) {
         const auto &info = input_infos_[i];
         std::cout << "  [" << i << "] " << info.name << ": [";
-        for (size_t j = 0; j < info.shape.size(); ++j) {
+        for (std::size_t j = 0; j < info.shape.size(); ++j) {
             std::cout << info.shape[j];
-            if (j < info.shape.size() - 1)
-                std::cout << ", ";
+            if (j + 1 < info.shape.size()) std::cout << ", ";
         }
-        std::cout << "] (total: " << info.total_size << ")" << std::endl;
+        std::cout << "] " << info.element_type_name
+                << " (total: " << info.total_size << ")" << std::endl;
     }
 
     std::cout << "输出数量: " << GetOutputCount() << std::endl;
     for (int i = 0; i < GetOutputCount(); ++i) {
         const auto &info = output_infos_[i];
         std::cout << "  [" << i << "] " << info.name << ": [";
-        for (size_t j = 0; j < info.shape.size(); ++j) {
+        for (std::size_t j = 0; j < info.shape.size(); ++j) {
             std::cout << info.shape[j];
-            if (j < info.shape.size() - 1)
-                std::cout << ", ";
+            if (j + 1 < info.shape.size()) std::cout << ", ";
         }
-        std::cout << "] (total: " << info.total_size << ")" << std::endl;
+        std::cout << "] " << info.element_type_name
+                << " (total: " << info.total_size << ")" << std::endl;
     }
     std::cout << "===================================" << std::endl;
 }

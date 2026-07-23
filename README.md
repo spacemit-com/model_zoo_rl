@@ -7,14 +7,21 @@ RL 策略推理执行器，负责 YAML 配置解析、观测组装、ONNX 推理
 ## 功能特性
 
 **支持：**
-- MLP / LSTM / obs_hist 三种模型结构，自动识别
+- 按 ONNX 张量名声明 `model_io`，不按 MLP/LSTM 等模型类别分派
+- 输入源：`observation` / `observation_history` / `feedback` / `constant` / `external`
+- 输出目标：`action` / `expose` / `ignore`；未知 I/O 一律初始化失败
+- 任意数量和命名的反馈状态，observation history 与 feedback 可作为独立输入同时使用
+- 每个策略必须显式声明完整 `model_io`，不根据 tensor 名或 shape 猜测语义
 - 三种观测历史模式：无历史、flat_history（按变量分组）、frame_history（按帧滑窗）
 - 运行时动态策略切换（重新加载 YAML 即可）
-- 自定义标量注入（如相位 `z`、标志 `stand_flag`）
-- 动作映射：scale、blend、default_pos 全部由 YAML 配置
+- 自定义 observation term 和独立 ONNX 输入/输出的上层注入、读取
+- observation/action clip，以及 scale、blend、default_pos 动作映射
 
 **不支持：**
 - PyTorch 原生推理（需先转换为 ONNX）
+- ONNX `string` / `complex` 外部 I/O、静态 batch>1、运行时改变 shape
+- FP8/INT4 的 float 语义自动转换；这类类型仅支持原生 packed `TensorView`
+- 多个 action head、随机分布采样和非关节位置 action 语义
 - aarch64 / RISC-V 上的 GPU 加速推理
 
 ## 快速开始
@@ -149,21 +156,25 @@ scripts/test/robot-test run  components/model_zoo/rl --scope scheduled # 真模�
 
 | 接口名称 | 参数 / 返回 | 功能说明 |
 | :--- | :--- | :--- |
-| `Init` | `const PolicyExecutorConfig &cfg` | 初始化执行器：加载 ONNX 模型（按名称自动识别 MLP/LSTM/obs_hist，多余输入输出自动忽略）、初始化观测处理、验证维度 |
+| `Init` | `const PolicyExecutorConfig &cfg` | 加载 ONNX，建立并严格校验全部 named tensor binding |
 | `ObsDim` | `void → int` | 返回预期观测向量维度 |
 | `ActionDim` | `void → int` | 返回动作向量维度 |
-| `HasLstm` | `void → bool` | 模型是否包含 LSTM 单元（影响推理循环方式） |
-| `HasObsHist` | `void → bool` | 是否使用 obs_hist 输入（长期观测历史） |
+| `FeedbackStateCount` | `void → int` | 自动回灌的 feedback 张量对数量 |
+| `HasObsHist` | `void → bool` | 是否使用 `observation_history` 输入 |
 | `SetCustomScalar / GetCustomScalar` | `const std::string &name, float value` | 设置/获取自定义标量（如 `"z"` 相位、`"stand_flag"` 标志） |
 | `SetCustomArray` | `const std::string &name, const float *data, int size` | 推入 N 维自定义数组 obs term（泛型扩展点）。配套 yaml `custom_array_dims: {name: dim}` 声明维度。例：tracking 策略通过 `SetCustomArray("motion_command", buf, 58)` 注入参考关节数据 |
+| `SetModelInput` | `key, float data, size` 或 `key, TensorView` | 以 float 语义值或原生 dtype 设置 `source: external` 输入 |
+| `GetModelOutput` | `key → const std::vector<float> &` | 以 float 便捷视图读取 `target: expose` 输出 |
+| `GetModelOutputTensor` | `key → TensorView` | 读取保留原生 dtype 的 `target: expose` 输出 |
 | `AssembleObs` | 传感器数据 → `Eigen::VectorXf &out_obs` | 组装观测向量：计算各段、交给对应处理器、拼接输出 |
-| `Infer` | `const Eigen::VectorXf &obs` → `std::vector<double> &action` | 执行推理：MLP / LSTM / obs_hist 均自动处理 |
+| `Infer` | `const Eigen::VectorXf &obs` → `std::vector<double> &action` | 按声明绑定输入、执行推理、反馈状态并处理输出 |
 | `MapActionToTargetPos` | `const std::vector<double> &action` → `std::vector<double> &target_pos` | 将策略动作映射为全身关节目标位置 |
 
 #### 核心数据结构
 
 **`PolicyExecutorConfig`** — 策略执行参数：
 - 模型路径、动作映射（scale、blend、default_pos）
+- 完整 `model_io` 输入输出绑定、可选 observation/action clip
 - 段式观测配置（terms、mode、length、order、include_current）
 - 观测归一化参数（ang_vel_scale、dof_pos_scale 等）
 - phase / gait_phase 相位参数
@@ -216,10 +227,33 @@ policy.MapActionToTargetPos(action, target_pos);
 | **flat_history** | `mode: flat_history` | 按变量分组的环形历史缓冲，同一 term 的多帧数据连续排列 | G1 dance/kungfu、青龙结构化历史 |
 | **frame_history** | `mode: frame_history` | 按帧的滑窗历史缓冲，每帧完整的 obs 连续排列 | 天工 walk、青龙滑窗历史 |
 
+#### 模型 I/O 绑定
+
+每个策略必须显式声明所有 ONNX 输入输出。以下配置同时演示 feedback、constant、external、expose 和 ignore：
+
+```yaml
+model_io:
+  inputs:
+    - {name: obs, source: observation}
+    - {name: h0, source: feedback, output: hn}
+    - {name: time_step, source: constant, value: 0.0}
+    - {name: mask, source: external, key: policy_mask, default: [1.0]}
+  outputs:
+    - {name: actions, target: action}
+    - {name: value, target: expose, key: critic_value}
+    - {name: debug, target: ignore}
+clip_observations: 100
+clip_actions: 100
+```
+
+`observation` 可用 `offset` 把完整观测切给多个输入；`observation_history` 用 `history_of` 指定要跟踪的 `observation` 输入，不跟踪 feedback、constant 或 external。`feedback` 初始为零，之后每帧自动回灌。feedback 输入输出允许 shape 不同，但必须具有相同 dtype 和元素数，复制时按扁平连续缓冲区重解释。`external` 无 `default` 时，首次 `Infer` 前必须由上层调用 `SetModelInput`。绑定缺失、重复绑定，以及自动 float 语义路径不支持的 dtype 会在 `Init` 失败；`external` 的原生 dtype 和元素数在 `SetModelInput` 时校验。
+
+当前部署 ABI 固定为 batch=1，并要求恰好一个确定性关节位置 action 输出。模型中的符号维度会在初始化时固定为 1，不支持运行时改变 shape；明确声明为静态 batch>1 的 observation/action 会初始化失败。ONNX backend 由 `Ort::Value` 按模型声明持有原生 dtype；observation/action 可继续使用 float 便捷视图，`external` / `expose` 可通过 `TensorView` 保留 INT64 等真实类型和精度。FP8/INT4 支持原始 packed buffer，不提供无量化参数的 float 自动转换。`external` / `expose` 不替代 observation term；随机策略、多 action head 或力矩 action 需要增加对应的可复用输出语义，或在导出 ONNX 时封装成该 ABI。
+
 #### 注意事项
 
 1. **观测维度匹配**：AssembleObs 输出维度必须等于 ObsDim()；若 strict_obs_dim_check = true，Infer 会严格验证
-2. **LSTM 推理循环**：若 HasLstm() = true，需在多帧推理中保持执行器状态，不可销毁/重建
+2. **反馈状态生命周期**：若 FeedbackStateCount() > 0，需在多帧推理中保持执行器实例；重建执行器会把状态清零
 3. **自定义标量生命周期**：SetCustomScalar 后有效直至下次修改；建议在每个推理循环的 AssembleObs 前重新设置
 4. **运行时策略切换**：调用 `LoadPolicyConfigFromYaml(yaml_path, new_policy_name, robot_dir)` 加载新策略后，销毁旧 PolicyExecutor，创建新实例并 Init；FSM 负责管理切换时机
 5. **段式观测细节**：mode 为空表示无历史仅输出当前帧；flat_history 按变量分组；frame_history 按帧组织

@@ -133,7 +133,7 @@ int main(int argc, char *argv[]) {
             << "Obs dim:    " << policy.ObsDim() << "\n"
             << "Action dim: " << policy.ActionDim() << "\n"
             << "DOF:        " << num_dof << "\n"
-            << "LSTM:       " << (policy.HasLstm() ? "yes" : "no") << "\n"
+            << "Feedback:   " << policy.FeedbackStateCount() << " state pairs\n"
             << "Obs hist:   " << (policy.HasObsHist() ? "yes" : "no") << "\n\n"
             << "Warmup: " << warmup << " rounds\n"
             << "Test:   " << rounds << " rounds\n"
