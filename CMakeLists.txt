@@ -43,7 +43,6 @@ target_include_directories(rl
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
         $<INSTALL_INTERFACE:include>
-        ${EIGEN3_INCLUDE_DIR}
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${CMAKE_CURRENT_SOURCE_DIR}/src/backends
@@ -51,7 +50,9 @@ target_include_directories(rl
 )
 
 target_link_libraries(rl
-    PUBLIC  ${ONNXRUNTIME_LIB}
+    PUBLIC
+        Eigen3::Eigen
+        ${ONNXRUNTIME_LIB}
     PRIVATE yaml-cpp
 )
 
