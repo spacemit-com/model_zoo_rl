@@ -3,261 +3,325 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * @file benchmark_policy_executor.cpp
- * @brief RL 完整链路端到端性能基准测试
+ * @brief RL 组件内部 PolicyExecutor 链路与周期调度 benchmark
  *
- * 测试完整控制链路的分段延迟：AssembleObs → Infer → MapActionToTargetPos
- * 反映真实运控场景的端到端性能，用于识别性能瓶颈和验证实时性要求。
- *
- * 用法:
- *   benchmark_policy_executor <yaml_path> <policy_name> <robot_dir>
- *                             [--warmup N] [--rounds N] [--verbose]
- *
- * 示例:
- *   benchmark_policy_executor \
- *     application/native/humanoid_unitree_g1/config/g1.yaml motion \
- *     application/native/humanoid_unitree_g1 \
- *     --warmup 100 --rounds 1000
+ * 测量 AssembleObs -> Infer -> MapActionToTargetPos。输入由 YAML 配置和固定的
+ * synthetic robot state 构造；本工具无法构造的 external input 或 custom array
+ * 会在运行前被明确拒绝。
  */
 
-#include <algorithm>
 #include <array>
-#include <chrono>
-#include <cmath>
-#include <cstring>
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
-#include <numeric>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
+#include "benchmark_common.h"
 #include "rl_service.h"
 
+namespace {
+
+using rl_benchmark::Clock;
+using rl_benchmark::Options;
+using rl_benchmark::Stats;
+using rl_benchmark::TimingResult;
 using rl_policy::LoadedPolicyConfig;
-using rl_policy::LoadPolicyConfigFromYaml;
+using rl_policy::ModelInputSource;
 using rl_policy::PolicyExecutor;
 
-// ---- ANSI 颜色 ----
-#define CLR_GREEN "\033[32m"
-#define CLR_RED   "\033[31m"
-#define CLR_BOLD  "\033[1m"
-#define CLR_RESET "\033[0m"
+struct ComponentSamples {
+    std::vector<double> obs_ms;
+    std::vector<double> infer_ms;
+    std::vector<double> map_ms;
 
-struct Stats {
-    double avg;
-    double std_dev;
-    double p50;
-    double p95;
-    double p99;
-    double max;
+    void Reserve(int rounds) {
+        obs_ms.reserve(rounds);
+        infer_ms.reserve(rounds);
+        map_ms.reserve(rounds);
+    }
 };
 
-static Stats compute_stats(std::vector<double> v) {
-    std::sort(v.begin(), v.end());
-    const int n = static_cast<int>(v.size());
-    const double sum = std::accumulate(v.begin(), v.end(), 0.0);
-    const double avg = sum / n;
-    double sq_sum = 0.0;
-    for (double x : v)
-        sq_sum += (x - avg) * (x - avg);
-    return {avg, std::sqrt(sq_sum / n),
-            v[n * 50 / 100],
-            v[n * 95 / 100],
-            v[n * 99 / 100],
-            v.back()};
+void PrintUsage(const char *program) {
+    std::cerr << "用法: " << program << " <yaml_path> <policy_name> <robot_dir> [options]\n";
+    rl_benchmark::PrintCommonUsage(std::cerr);
 }
 
-static void parse_args(int argc, char *argv[], int &warmup, int &rounds, int &hz, bool &verbose) {
-    warmup  = 100;
-    rounds  = 1000;
-    hz      = 50;
-    verbose = false;
-    for (int i = 4; i < argc; ++i) {
-        if (!std::strcmp(argv[i], "--warmup") && i + 1 < argc)
-            warmup = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc)
-            rounds = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--hz") && i + 1 < argc)
-            hz = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "--verbose"))
-            verbose = true;
+void ValidatePipelineBoundary(const LoadedPolicyConfig &loaded) {
+    std::vector<std::string> reasons;
+    for (const auto &input : loaded.exec_cfg.model_io.inputs) {
+        if (input.source != ModelInputSource::EXTERNAL ||
+            !input.initial_value.empty()) {
+            continue;
+        }
+        const std::string key = input.key.empty() ? input.name : input.key;
+        reasons.push_back("external_without_default=" + key);
+    }
+    if (!loaded.exec_cfg.custom_array_dims.empty()) {
+        reasons.push_back("custom_array observation injection");
+    }
+    if (reasons.empty())
+        return;
+
+    std::string detail;
+    for (const auto &reason : reasons) {
+        if (!detail.empty())
+            detail += ", ";
+        detail += reason;
+    }
+    throw std::runtime_error(
+        "benchmark_policy_executor cannot populate required inputs (" + detail +
+        "). Provide them in an integration or replay runner; use "
+        "benchmark_onnx_infer only for explicitly synthetic backend timing.");
+}
+
+void PrintStats(const std::string &label, const Stats &stats) {
+    std::cout << std::left << std::setw(22) << label << " min=" << std::right << std::fixed
+            << std::setprecision(3) << stats.min << " avg=" << stats.avg
+            << " std=" << stats.std_dev << " p50=" << stats.p50 << " p95=" << stats.p95
+            << " p99=" << stats.p99;
+    if (stats.has_p999)
+        std::cout << " p99.9=" << stats.p999;
+    if (stats.has_p9999)
+        std::cout << " p99.99=" << stats.p9999;
+    std::cout << " max=" << stats.max << " ms\n";
+}
+
+void WriteCsv(const std::string &path,
+    const std::string &policy_name,
+    const std::string &model_path,
+    const Options &options,
+    double input_dt,
+    const std::string &affinity_before_init,
+    const std::string &affinity_after_init,
+    const rl_policy::InferenceRuntimeInfo &runtime,
+    const TimingResult &timing,
+    const ComponentSamples &components) {
+    if (path.empty())
+        return;
+    auto output = rl_benchmark::OpenCsv(path);
+    output << "# benchmark=rl_policy_executor_component_pipeline\n"
+        << "# policy=" << policy_name << "\n"
+        << "# model=" << model_path << "\n"
+        << "# build_type=" << RL_BENCHMARK_BUILD_TYPE << "\n"
+        << "# cxx_flags=" << RL_BENCHMARK_CXX_FLAGS << "\n"
+        << "# mode=" << rl_benchmark::ModeName(options.mode) << "\n"
+        << "# hz=" << options.hz << "\n"
+        << "# input_dt=" << input_dt << "\n"
+        << "# provider_requested=" << runtime.requested_provider << "\n"
+        << "# provider_initialized=" << runtime.initialized_provider << "\n"
+        << "# provider_status=" << runtime.provider_status << "\n"
+        << "# threads=" << options.threads << "\n"
+        << "# ep_threads_requested=" << runtime.ep_threads << "\n"
+        << "# ort_spinning=" << (runtime.ort_spinning ? "on" : "off") << "\n"
+        << "# affinity_requested=" << options.affinity << "\n"
+        << "# affinity_effective_before_init=" << affinity_before_init << "\n"
+        << "# affinity_effective_after_init=" << affinity_after_init << "\n"
+        << "# affinity_ep_requested=" << runtime.affinity << "\n"
+        << "# ep_dump_subgraphs=" << (options.ep_dump_subgraphs ? "true" : "false") << "\n"
+        << "# ep_profile_prefix=" << options.ep_profile_prefix << "\n"
+        << "# measure_start_delay_ms=" << options.measure_start_delay_ms << "\n"
+        << "iteration,release_index,dropped_before,backlog_releases,"
+            "obs_ms,infer_ms,map_ms,service_ms,release_jitter_ms,response_ms,"
+            "deadline_lateness_ms\n";
+    for (std::size_t i = 0; i < timing.samples.size(); ++i) {
+        const auto &sample = timing.samples[i];
+        output << i << ',' << sample.release_index << ',' << sample.dropped_before << ','
+            << sample.backlog_releases << ',' << components.obs_ms[i] << ','
+            << components.infer_ms[i] << ',' << components.map_ms[i] << ',' << sample.service_ms
+            << ',' << sample.release_jitter_ms << ',' << sample.response_ms << ','
+            << sample.deadline_lateness_ms << '\n';
     }
 }
 
-// 打印单行统计表格行
-static void print_row(const std::string &label, const Stats &s, bool bold = false) {
-    const char *prefix = bold ? CLR_BOLD : "";
-    std::cout << prefix
-            << "  " << std::left << std::setw(16) << label
-            << std::right << std::fixed << std::setprecision(3)
-            << std::setw(8) << s.avg
-            << std::setw(8) << s.p50
-            << std::setw(8) << s.p95
-            << std::setw(8) << s.p99
-            << std::setw(8) << s.max
-            << (bold ? CLR_RESET : "") << "\n";
+void PrintVerbose(const TimingResult &timing, const ComponentSamples &components) {
+    for (std::size_t i = 0; i < timing.samples.size(); ++i) {
+        const auto &sample = timing.samples[i];
+        std::cout << "sample=" << i << " release=" << sample.release_index
+                << " obs_ms=" << components.obs_ms[i] << " infer_ms=" << components.infer_ms[i]
+                << " map_ms=" << components.map_ms[i] << " service_ms=" << sample.service_ms;
+        if (sample.response_ms != sample.service_ms) {
+            std::cout << " jitter_ms=" << sample.release_jitter_ms
+                    << " response_ms=" << sample.response_ms
+                    << " lateness_ms=" << sample.deadline_lateness_ms;
+        }
+        std::cout << '\n';
+    }
 }
+
+}  // namespace
 
 int main(int argc, char *argv[]) {
     if (argc < 4) {
-        std::cerr << "用法: " << argv[0]
-                << " <yaml_path> <policy_name> <robot_dir>"
-                    " [--warmup N] [--rounds N] [--verbose]\n"
-                << "示例:\n  " << argv[0]
-                << " application/native/humanoid_unitree_g1/config/g1.yaml"
-                    " motion application/native/humanoid_unitree_g1\n";
+        PrintUsage(argv[0]);
         return 1;
     }
 
-    int warmup, rounds, hz;
-    bool verbose;
-    parse_args(argc, argv, warmup, rounds, hz, verbose);
-
-    // 加载策略配置并初始化执行器
-    LoadedPolicyConfig loaded_cfg;
     try {
-        loaded_cfg = LoadPolicyConfigFromYaml(argv[1], argv[2], argv[3]);
-    } catch (const std::exception &e) {
-        std::cerr << "[benchmark_policy_executor] 配置加载失败: " << e.what() << "\n";
-        return 1;
+        const std::string yaml_path = argv[1];
+        const std::string policy_name = argv[2];
+        const std::string robot_dir = argv[3];
+        LoadedPolicyConfig loaded
+            = rl_policy::LoadPolicyConfigFromYaml(yaml_path, policy_name, robot_dir);
+        ValidatePipelineBoundary(loaded);
+
+        const Options options = rl_benchmark::ParseOptions(argc, argv, 4, 1.0 / loaded.rl_dt);
+        const double input_dt = options.hz_overridden ? 1.0 / options.hz : loaded.rl_dt;
+        const std::string affinity_before_init
+            = rl_benchmark::ApplyAndGetAffinity(options.affinity);
+        const std::string requested_ep_affinity = options.ep_affinity.empty()
+            ? options.affinity
+            : options.ep_affinity;
+        const std::string ep_affinity = rl_benchmark::EpAffinityFromCpuList(
+            requested_ep_affinity,
+            options.threads,
+            rl_benchmark::ShouldConfigureSpaceMITProvider(options.provider));
+
+        loaded.exec_cfg.runtime.provider = options.provider;
+        loaded.exec_cfg.runtime.threads = options.threads;
+        loaded.exec_cfg.runtime.affinity = ep_affinity;
+        loaded.exec_cfg.runtime.ep_dump_subgraphs = options.ep_dump_subgraphs;
+        loaded.exec_cfg.runtime.ep_profile_prefix = options.ep_profile_prefix;
+        loaded.exec_cfg.runtime.ort_spinning = options.ort_spinning;
+
+        PolicyExecutor policy;
+        policy.Init(loaded.exec_cfg);
+        const std::string affinity_after_init = rl_benchmark::ApplyAndGetAffinity("");
+        const auto runtime = policy.GetRuntimeInfo();
+        const int num_dof = static_cast<int>(loaded.exec_cfg.rl_default_pos.size());
+
+        std::cout << "\nRL PolicyExecutor component benchmark\n"
+                << "Policy:      " << policy_name << "\n"
+                << "Model:       " << loaded.exec_cfg.model_path << "\n"
+                << "Semantics:   PolicyExecutor step with fixed synthetic robot state\n"
+                << "Mode:        " << rl_benchmark::ModeName(options.mode) << "\n"
+                << "Frequency:   " << options.hz << " Hz (input dt=" << input_dt << " s)\n"
+                << "Provider:    requested=" << runtime.requested_provider
+                << ", initialized=" << runtime.initialized_provider << "\n"
+                << "EP status:   " << runtime.provider_status << "\n"
+                << "Threads:     ORT intra=" << runtime.ort_intra_threads
+                << ", ORT inter=" << runtime.ort_inter_threads
+                << ", EP requested=" << runtime.ep_threads
+                << "\n"
+                << "ORT spin:    " << (runtime.ort_spinning ? "on" : "off")
+                << " (intra-op only; does not control SpaceMIT EP workers)\n"
+                << "Host affinity: requested="
+                << (options.affinity.empty() ? "not-set" : options.affinity)
+                << ", before-init=" << affinity_before_init
+                << ", after-init=" << affinity_after_init << "\n"
+                << "EP affinity requested: "
+                << (runtime.affinity.empty() ? "not-set" : runtime.affinity)
+                << "\n"
+                << "EP diagnose: dump=" << (options.ep_dump_subgraphs ? "on" : "off")
+                << ", profile="
+                << (options.ep_profile_prefix.empty() ? "off" : options.ep_profile_prefix) << "\n"
+                << "Obs/action:  " << policy.ObsDim() << '/' << policy.ActionDim()
+                << ", DOF=" << num_dof << "\n"
+                << "Feedback:    " << policy.FeedbackStateCount()
+                << ", obs history=" << (policy.HasObsHist() ? "yes" : "no") << "\n"
+                << "Warmup/test: " << options.warmup << '/' << options.rounds << "\n";
+        rl_benchmark::PrintBuildMetadata();
+        std::cout << "Thread count and affinity are configuration evidence, not proof that "
+                    "every allowed CPU stayed busy.\n";
+
+        const std::array<double, 3> gyro = {0.01, -0.02, 0.03};
+        const std::array<double, 3> rpy = {0.0, 0.0, 0.0};
+        const std::array<double, 4> base_quat = {1.0, 0.0, 0.0, 0.0};
+        const std::array<double, 3> base_vel = {0.0, 0.0, 0.0};
+        const double cmd_vx = loaded.command_init[0];
+        const double cmd_vy = loaded.command_init[1];
+        const double cmd_wz = loaded.command_init[2];
+        const std::vector<double> joint_pos = loaded.exec_cfg.rl_default_pos;
+        const std::vector<double> joint_vel(num_dof, 0.0);
+
+        Eigen::VectorXf obs;
+        std::vector<double> action;
+        std::vector<double> target_pos;
+        ComponentSamples components;
+        components.Reserve(options.rounds);
+
+        const auto run_step = [&](bool measured) {
+            const auto obs_start = Clock::now();
+            policy.AssembleObs(gyro,
+                rpy,
+                cmd_vx,
+                cmd_vy,
+                cmd_wz,
+                joint_pos,
+                joint_vel,
+                base_quat,
+                base_vel,
+                static_cast<float>(input_dt),
+                obs);
+            const auto infer_start = Clock::now();
+            policy.Infer(obs, action);
+            const auto map_start = Clock::now();
+            policy.MapActionToTargetPos(action, target_pos);
+            const auto finish = Clock::now();
+            if (measured) {
+                components.obs_ms.push_back(rl_benchmark::ToMilliseconds(infer_start - obs_start));
+                components.infer_ms.push_back(
+                    rl_benchmark::ToMilliseconds(map_start - infer_start));
+                components.map_ms.push_back(rl_benchmark::ToMilliseconds(finish - map_start));
+            }
+        };
+
+        std::cout << "Warmup...\n" << std::flush;
+        for (int i = 0; i < options.warmup; ++i)
+            run_step(false);
+
+        rl_benchmark::BeginMeasuredRegion(options);
+        const TimingResult timing
+            = rl_benchmark::MeasureRounds(options, [&](std::uint64_t) { run_step(true); });
+        rl_benchmark::EndMeasuredRegion();
+
+        PrintStats("Obs assembly", rl_benchmark::ComputeStats(components.obs_ms));
+        PrintStats("Inference", rl_benchmark::ComputeStats(components.infer_ms));
+        PrintStats("Action mapping", rl_benchmark::ComputeStats(components.map_ms));
+        PrintStats("RL component step",
+            rl_benchmark::ComputeStats(rl_benchmark::ExtractMetric(
+                timing.samples, &rl_benchmark::TimingSample::service_ms)));
+
+        if (options.mode == rl_benchmark::Mode::PERIODIC) {
+            PrintStats("Release jitter",
+                rl_benchmark::ComputeStats(rl_benchmark::ExtractMetric(
+                    timing.samples, &rl_benchmark::TimingSample::release_jitter_ms)));
+            PrintStats("Release-to-done",
+                rl_benchmark::ComputeStats(rl_benchmark::ExtractMetric(
+                    timing.samples, &rl_benchmark::TimingSample::response_ms)));
+            PrintStats("Deadline lateness",
+                rl_benchmark::ComputeStats(rl_benchmark::ExtractMetric(
+                    timing.samples, &rl_benchmark::TimingSample::deadline_lateness_ms)));
+            std::cout << "Periodic deadline: misses=" << timing.deadline_misses << '/'
+                    << options.rounds << ", dropped_releases=" << timing.dropped_releases
+                    << ", max_backlog=" << timing.max_backlog_releases
+                    << " (valid only for this PolicyExecutor benchmark boundary)\n";
+        } else {
+            std::cout << "Throughput mode has no release schedule and makes no deadline claim.\n";
+        }
+        if (options.rounds < 100000) {
+            std::cout << "P99.99 not reported: use at least 100000 rounds with --csv.\n";
+        }
+
+        WriteCsv(options.csv_path,
+            policy_name,
+            loaded.exec_cfg.model_path,
+            options,
+            input_dt,
+            affinity_before_init,
+            affinity_after_init,
+            runtime,
+            timing,
+            components);
+        if (!options.csv_path.empty()) {
+            std::cout << "Raw CSV: " << options.csv_path << "\n";
+        }
+        if (options.verbose_after_timing)
+            PrintVerbose(timing, components);
+        return 0;
+    } catch (const std::exception &error) {
+        std::cerr << "[benchmark_policy_executor] " << error.what() << '\n';
+        return 2;
     }
-
-    PolicyExecutor policy;
-    policy.Init(loaded_cfg.exec_cfg);
-
-    const int num_dof = static_cast<int>(loaded_cfg.exec_cfg.rl_default_pos.size());
-
-    std::cout << CLR_BOLD << std::string(56, '=') << CLR_RESET << "\n"
-            << CLR_BOLD << "RL Policy Executor Benchmark" << CLR_RESET << "\n"
-            << CLR_BOLD << std::string(56, '=') << CLR_RESET << "\n"
-            << "Policy:     " << argv[2] << "\n"
-            << "Obs dim:    " << policy.ObsDim() << "\n"
-            << "Action dim: " << policy.ActionDim() << "\n"
-            << "DOF:        " << num_dof << "\n"
-            << "Feedback:   " << policy.FeedbackStateCount() << " state pairs\n"
-            << "Obs hist:   " << (policy.HasObsHist() ? "yes" : "no") << "\n\n"
-            << "Warmup: " << warmup << " rounds\n"
-            << "Test:   " << rounds << " rounds\n"
-            << std::flush;
-
-    // 模拟传感器数据（固定值，排除外部随机波动对 timing 的干扰）
-    const std::array<double, 3> gyro     = {0.01, -0.02, 0.03};
-    const std::array<double, 3> rpy      = {0.0, 0.0, 0.0};
-    const std::array<double, 4> base_quat = {1.0, 0.0, 0.0, 0.0};
-    const std::array<double, 3> base_vel  = {0.0, 0.0, 0.0};
-    const double cmd_vx = loaded_cfg.command_init[0];
-    const double cmd_vy = loaded_cfg.command_init[1];
-    const double cmd_wz = loaded_cfg.command_init[2];
-    const std::vector<double> joint_pos = loaded_cfg.exec_cfg.rl_default_pos;
-    const std::vector<double> joint_vel(num_dof, 0.0);
-    const float dt = static_cast<float>(
-        loaded_cfg.exec_cfg.phase_period > 0 ? 0.02 : 0.02);  // 50Hz 控制周期
-
-    Eigen::VectorXf obs;
-    std::vector<double> action;
-    std::vector<double> target_pos;
-
-    // 预热
-    std::cout << "\n[1/2] 预热中...\n" << std::flush;
-    for (int i = 0; i < warmup; ++i) {
-        policy.AssembleObs(gyro, rpy, cmd_vx, cmd_vy, cmd_wz,
-                            joint_pos, joint_vel, base_quat, base_vel, dt, obs);
-        policy.Infer(obs, action);
-        policy.MapActionToTargetPos(action, target_pos);
-    }
-
-    // 基准测试：分段计时
-    std::cout << "[2/2] 测试中...\n" << std::flush;
-
-    std::vector<double> obs_lat(rounds);
-    std::vector<double> infer_lat(rounds);
-    std::vector<double> map_lat(rounds);
-    std::vector<double> e2e_lat(rounds);
-
-    for (int i = 0; i < rounds; ++i) {
-        auto t0 = std::chrono::high_resolution_clock::now();
-        policy.AssembleObs(gyro, rpy, cmd_vx, cmd_vy, cmd_wz,
-                            joint_pos, joint_vel, base_quat, base_vel, dt, obs);
-        auto t1 = std::chrono::high_resolution_clock::now();
-        policy.Infer(obs, action);
-        auto t2 = std::chrono::high_resolution_clock::now();
-        policy.MapActionToTargetPos(action, target_pos);
-        auto t3 = std::chrono::high_resolution_clock::now();
-
-        obs_lat[i]   = std::chrono::duration<double, std::milli>(t1 - t0).count();
-        infer_lat[i] = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        map_lat[i]   = std::chrono::duration<double, std::milli>(t3 - t2).count();
-        e2e_lat[i]   = std::chrono::duration<double, std::milli>(t3 - t0).count();
-
-        if (verbose)
-            std::cout << "  round " << std::setw(4) << i
-                    << "  obs=" << std::fixed << std::setprecision(3) << obs_lat[i]
-                    << "  infer=" << infer_lat[i]
-                    << "  map=" << map_lat[i]
-                    << "  e2e=" << e2e_lat[i] << " ms\n";
-    }
-
-    const Stats s_obs   = compute_stats(obs_lat);
-    const Stats s_infer = compute_stats(infer_lat);
-    const Stats s_map   = compute_stats(map_lat);
-    const Stats s_e2e   = compute_stats(e2e_lat);
-    const double deadline_ms = 1000.0 / hz;
-    const int miss_count = static_cast<int>(
-        std::count_if(e2e_lat.begin(), e2e_lat.end(),
-                    [deadline_ms](double x) { return x > deadline_ms; }));
-    const double miss_rate = miss_count * 100.0 / rounds;
-
-    // 打印汇总表格
-    std::cout << "\n"
-            << CLR_BOLD << std::string(56, '-') << CLR_RESET << "\n"
-            << CLR_BOLD
-            << "  " << std::left << std::setw(16) << "Component (ms)"
-            << std::right
-            << std::setw(8) << "Avg"
-            << std::setw(8) << "P50"
-            << std::setw(8) << "P95"
-            << std::setw(8) << "P99"
-            << std::setw(8) << "Max"
-            << CLR_RESET << "\n"
-            << CLR_BOLD << std::string(56, '-') << CLR_RESET << "\n";
-
-    print_row("Obs Assembly",   s_obs);
-    print_row("Inference",      s_infer);
-    print_row("Action Mapping", s_map);
-
-    std::cout << CLR_BOLD << std::string(56, '-') << CLR_RESET << "\n";
-    print_row("End-to-End", s_e2e, true);
-
-    // 超时率
-    std::cout << "\n"
-            << CLR_BOLD << std::string(56, '-') << CLR_RESET << "\n"
-            << CLR_BOLD << "Deadline (" << hz << "Hz = " << std::fixed
-            << std::setprecision(1) << deadline_ms << "ms)" << CLR_RESET << "\n"
-            << CLR_BOLD << std::string(56, '-') << CLR_RESET << "\n";
-
-    if (miss_count == 0)
-        std::cout << CLR_GREEN << CLR_BOLD
-                << "  Miss: 0 / " << rounds << " (0.00%)" << CLR_RESET << "\n";
-    else
-        std::cout << CLR_RED << CLR_BOLD
-                << "  Miss: " << miss_count << " / " << rounds
-                << " (" << std::setprecision(2) << miss_rate << "%)" << CLR_RESET << "\n";
-
-    std::cout << "\n";
-    if (s_e2e.max < deadline_ms)
-        std::cout << CLR_GREEN << CLR_BOLD
-                << "✓ 满足 " << hz << "Hz 实时要求 (Max " << std::setprecision(2)
-                << s_e2e.max << "ms < " << deadline_ms << "ms)" << CLR_RESET << "\n";
-    else
-        std::cout << CLR_RED << CLR_BOLD
-                << "✗ 不满足 " << hz << "Hz 实时要求 (Max " << std::setprecision(2)
-                << s_e2e.max << "ms >= " << deadline_ms << "ms)" << CLR_RESET << "\n";
-
-    // 瓶颈分析
-    if (s_e2e.avg > 0) {
-        const double infer_pct = s_infer.avg / s_e2e.avg * 100.0;
-        std::cout << "\n瓶颈分析: 推理占端到端耗时 "
-                << std::fixed << std::setprecision(1) << infer_pct << "%\n";
-    }
-
-    return 0;
 }

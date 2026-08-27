@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# repo 的 mm 默认不会传 CMAKE_BUILD_TYPE。RL 推理和 benchmark 若在无优化
+# 配置下构建，会把 O0 延迟误当成部署性能，因此单配置生成器默认使用 Release。
+# 调试时仍可显式传 -DCMAKE_BUILD_TYPE=Debug 覆盖。
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "RL build type" FORCE)
+endif()
+message(STATUS "RL build type: ${CMAKE_BUILD_TYPE}")
+
 # RISC-V 对齐标志（对齐 asr 组件做法）
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv|RISCV")
     add_compile_options(-mstrict-align -fno-aggressive-loop-optimizations)
@@ -56,6 +64,21 @@ target_link_libraries(rl
     PRIVATE yaml-cpp
 )
 
+# Bianbu 的 ONNX Runtime 头在 RISC-V Zfh 路径使用 __fp16，但 GCC 13
+# 只提供标准 _Float16。沿用 SDK vision 组件的探测方式，仅给依赖头做兼容映射，
+# 不修改系统头文件。
+include(CheckCXXSourceCompiles)
+set(CMAKE_REQUIRED_QUIET TRUE)
+check_cxx_source_compiles(
+    "int main() { __fp16 x = 0; (void)x; return 0; }"
+    RL_HAVE_NATIVE_FP16
+)
+unset(CMAKE_REQUIRED_QUIET)
+if(NOT RL_HAVE_NATIVE_FP16)
+    target_compile_definitions(rl PRIVATE __fp16=_Float16)
+    message(STATUS "rl: defining __fp16=_Float16 for ONNX Runtime headers")
+endif()
+
 if(SPACEMIT_EP_LIB)
     target_link_libraries(rl PUBLIC ${SPACEMIT_EP_LIB})
 endif()
@@ -71,6 +94,12 @@ install(TARGETS rl
 
 install(FILES include/rl_service.h
     DESTINATION include
+)
+
+# 供下游 benchmark 复用周期释放、affinity 和统计语义。该头文件属于
+# benchmark 开发接口，不进入 RL 运行时公共 API 的根命名空间。
+install(FILES example/benchmark_common.h
+    DESTINATION include/rl_benchmark
 )
 
 # 当 onnxruntime 来自非系统路径（如 ~/.cache/thirdparty fetch 来的），把 .so
@@ -90,6 +119,7 @@ endif()
 if(BUILD_EXAMPLES)
     add_executable(test_policy_executor example/test_policy_executor.cpp)
     target_link_libraries(test_policy_executor PRIVATE rl)
+    target_compile_options(test_policy_executor PRIVATE -UNDEBUG)
     target_include_directories(test_policy_executor PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -101,6 +131,7 @@ if(BUILD_EXAMPLES)
 
     add_executable(test_onnx_infer example/test_onnx_infer.cpp)
     target_link_libraries(test_onnx_infer PRIVATE rl)
+    target_compile_options(test_onnx_infer PRIVATE -UNDEBUG)
     target_include_directories(test_onnx_infer PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -124,7 +155,7 @@ if(BUILD_EXAMPLES)
     )
     install(TARGETS benchmark_onnx_infer RUNTIME DESTINATION bin)
 
-    # 性能基准测试：完整链路（AssembleObs → Infer → MapActionToTargetPos 分段延迟）
+    # 性能基准测试：PolicyExecutor 观测组装、推理和动作映射
     add_executable(benchmark_policy_executor example/benchmark_policy_executor.cpp)
     target_link_libraries(benchmark_policy_executor PRIVATE rl)
     target_include_directories(benchmark_policy_executor PRIVATE
@@ -135,6 +166,19 @@ if(BUILD_EXAMPLES)
         BUILD_RPATH_USE_ORIGIN ON
     )
     install(TARGETS benchmark_policy_executor RUNTIME DESTINATION bin)
+
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" _rl_build_type_upper)
+    get_directory_property(_rl_directory_compile_options COMPILE_OPTIONS)
+    string(JOIN " " _rl_directory_compile_flags ${_rl_directory_compile_options})
+    set(_rl_benchmark_flags
+        "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_rl_build_type_upper}} ${_rl_directory_compile_flags}")
+    string(STRIP "${_rl_benchmark_flags}" _rl_benchmark_flags)
+    foreach(_benchmark_target benchmark_onnx_infer benchmark_policy_executor)
+        target_compile_definitions(${_benchmark_target} PRIVATE
+            RL_BENCHMARK_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+            RL_BENCHMARK_CXX_FLAGS="${_rl_benchmark_flags}"
+        )
+    endforeach()
 
     install(PROGRAMS
         scripts/run_benchmark_onnx.sh

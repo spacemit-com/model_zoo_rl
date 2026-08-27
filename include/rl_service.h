@@ -174,6 +174,28 @@ struct ModelIOConfig {
     std::vector<ModelOutputBindingConfig> outputs;
 };
 
+/** @brief ONNX Runtime provider 与线程配置。 */
+struct InferenceRuntimeConfig {
+    std::string provider = "auto";  ///< auto | cpu | spacemit
+    int threads = 1;                ///< CPU intra-op 或 SpaceMIT EP 线程数
+    std::string affinity;           ///< SpaceMIT EP CPU 列表，分号分隔，例如 "0;1"
+    bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
+    std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
+    bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin
+};
+
+/** @brief 实际初始化出的推理会话信息。 */
+struct InferenceRuntimeInfo {
+    std::string requested_provider;
+    std::string initialized_provider;
+    int ort_intra_threads = 1;
+    int ort_inter_threads = 1;
+    int ep_threads = 0;             ///< 传给 EP 的请求值，不代表实际并行核数
+    std::string affinity;           ///< 传给 EP 的请求值，不代表实际线程落核
+    std::string provider_status;
+    bool ort_spinning = true;
+};
+
 // ============================================================
 // 策略执行器配置（YAML 驱动）
 // ============================================================
@@ -185,6 +207,9 @@ struct PolicyExecutorConfig {
     double action_blend_ratio = 1.0;
     std::vector<double> rl_default_pos;
     std::vector<int> action_joint_index;
+
+    // ---- 推理 backend ----
+    InferenceRuntimeConfig runtime;
 
     // ---- 模型 I/O 拓扑 ----
     ModelIOConfig model_io;
@@ -233,6 +258,7 @@ struct PolicyExecutorConfig {
 struct LoadedPolicyConfig {
     PolicyExecutorConfig exec_cfg;
     std::array<double, 3> command_init = {0.0, 0.0, 0.0};
+    double rl_dt = 0.02;
     int infer_decimation = 4;
     double max_roll = 0.7;
     double max_pitch = 0.7;
@@ -288,6 +314,9 @@ public:
 
     /** @return 是否使用 observation_history 输入 */
     bool HasObsHist() const;
+
+    /** @return 实际初始化出的推理 provider 与线程信息。 */
+    InferenceRuntimeInfo GetRuntimeInfo() const;
 
     /** @brief 打印模型信息 */
     void PrintModelInfo() const;

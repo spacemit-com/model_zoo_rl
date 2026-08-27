@@ -65,6 +65,28 @@ struct TensorInfo {
     std::string element_type_name;       ///< 便于日志展示的 dtype 名称
 };
 
+/** @brief ONNX Runtime 会话配置。 */
+struct RuntimeOptions {
+    std::string provider = "auto";  ///< auto | cpu | spacemit
+    int threads = 1;                ///< CPU intra-op 或 SpaceMIT EP 线程数
+    std::string affinity;           ///< SpaceMIT EP CPU 列表，分号分隔，例如 "0;1"
+    bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
+    std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
+    bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin
+};
+
+/** @brief 实际创建出的 ONNX Runtime 会话信息。 */
+struct RuntimeInfo {
+    std::string requested_provider = "auto";
+    std::string initialized_provider = "unknown";
+    int ort_intra_threads = 1;
+    int ort_inter_threads = 1;
+    int ep_threads = 0;             ///< 传给 EP 的请求值，不代表实际并行核数
+    std::string affinity;           ///< 传给 EP 的请求值，不代表实际线程落核
+    std::string provider_status;
+    bool ort_spinning = true;
+};
+
 /**
  * @brief ONNX Runtime 推理封装类
  *
@@ -83,6 +105,12 @@ public:
     bool Init(const std::string &model_file);
 
     /**
+     * @brief 使用显式 provider、线程数和 affinity 初始化模型。
+     * @return 成功返回 true；显式请求 spacemit 时不会静默回退 CPU。
+     */
+    bool Init(const std::string &model_file, const RuntimeOptions &options);
+
+    /**
      * @brief 执行一次推理
      * @return 成功返回 true，失败返回 false，详情通过 GetLastError() 获取
      */
@@ -90,6 +118,9 @@ public:
 
     /** @return 最近一次初始化或推理失败的错误信息 */
     const std::string &GetLastError() const;
+
+    /** @return 当前会话的 provider 与线程配置。 */
+    const RuntimeInfo &GetRuntimeInfo() const;
 
     /** @return 模型输入个数 */
     int GetInputCount() const;
@@ -149,6 +180,7 @@ private:
 
     std::string last_error_;
     bool outputs_valid_ = false;
+    RuntimeInfo runtime_info_;
 };
 
 }  // namespace onnx_runtime

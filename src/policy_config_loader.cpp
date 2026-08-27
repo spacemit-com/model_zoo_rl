@@ -8,6 +8,7 @@
 
 #include <yaml-cpp/yaml.h>
 
+#include <cmath>
 #include <filesystem>  // NOLINT(build/c++17)
 #include <stdexcept>
 #include <string>
@@ -95,6 +96,10 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
     }
 
     LoadedPolicyConfig out;
+    out.rl_dt = NodeAs(cfg["rl_policy"]["rl_dt"], 0.02);
+    if (!std::isfinite(out.rl_dt) || out.rl_dt <= 0.0) {
+        throw std::runtime_error("[PolicyConfigLoader] rl_policy.rl_dt 必须是正数");
+    }
     const fs::path robot_dir_path(robot_dir);
     out.exec_cfg.model_path =
         fs::weakly_canonical(robot_dir_path / policy["model_path"].as<std::string>()).string();
