@@ -72,6 +72,10 @@ cd components/model_zoo/rl
 mm
 ```
 
+单配置生成器未显式指定 `CMAKE_BUILD_TYPE` 时，本组件默认使用 `Release`
+（`-O3 -DNDEBUG`）。benchmark 启动时会打印实际 build type 和编译 flags；
+不要使用旧的 O0 产物做性能结论。
+
 编译产物安装至 `output/staging/`：
 - 动态库：`output/staging/lib/librl.so`
 - 测试程序：`output/staging/bin/test_policy_executor`、`output/staging/bin/test_onnx_infer`
@@ -82,10 +86,8 @@ mm
 **独立 cmake 编译**：
 
 ```bash
-cd components/model_zoo/rl
-mkdir build && cd build
-cmake ..
-make
+cmake -S components/model_zoo/rl -B /tmp/rl-build -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/rl-build -j
 ```
 
 ### 运行示例
@@ -95,37 +97,70 @@ make
 ```bash
 cd ~/spacemit_robot
 ./output/staging/bin/test_policy_executor \
-  application/native/humanoid_unitree_g1/config/g1.yaml motion \
+  application/native/humanoid_unitree_g1/config/g1.yaml walk_mjlab \
   application/native/humanoid_unitree_g1
 ```
 
 **性能基准测试：**
 
-两个基准工具，目标不同，按需选用：
+组件提供两个性能工具，分别隔离 backend 和 `PolicyExecutor`：
 
-`run_benchmark_onnx.sh` — 纯推理基准，隔离测试 ONNX Runtime 推理引擎本身的延迟，排除 obs 组装和动作映射的干扰。适用于对比不同硬件（x86 vs K3）或不同模型结构（MLP / LSTM）的推理性能。
+`run_benchmark_onnx.sh` 使用 synthetic 输入测量当前 ONNX backend。它会按
+`model_io` 回灌 recurrent feedback、应用 constant；缺少默认值的 external
+输入会使用 synthetic 数据并明确列出。指标分为 `ONNX Run` 和包含输入更新、
+feedback copy 的 `Backend step`。
 
-`run_benchmark_policy.sh` — 完整链路基准，测试真实运控场景的端到端性能，对 `AssembleObs → Infer → MapActionToTargetPos` 三个阶段分别计时，识别性能瓶颈。
+`run_benchmark_policy.sh` 测量
+`AssembleObs → Infer → MapActionToTargetPos`，输入来自 YAML 配置和固定的
+synthetic robot state。缺少默认值的 external model input 或 custom array
+无法由该工具生成，因此会在计时前明确拒绝；这类策略需要由能够提供完整输入的
+集成或 replay runner 测量。
 
 ```bash
 cd ~/spacemit_robot/output/staging/bin
-run_benchmark_onnx.sh                               # g1 + motion，默认参数
-run_benchmark_policy.sh g1 motion --rounds 2000     # 增加测试轮数
-run_benchmark_policy.sh tiangong walk               # 其他机型/策略
+./run_benchmark_policy.sh g1 walk_mjlab \
+  --provider cpu --threads 2 --affinity 0,1 \
+  --ort-spinning off \
+  --mode periodic --hz 50 --rounds 1000 --csv /tmp/g1_walk_mjlab.csv
+
+./run_benchmark_onnx.sh g1 walk_mjlab \
+  --provider cpu --threads 2 --affinity 0,1 \
+  --mode throughput --rounds 1000 --csv /tmp/g1_walk_mjlab_backend.csv
 ```
 
 公共参数：
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `robot` | 机型名称（g1/go1/h1_2/r1/asimov/tinker/qinglong/tiangong） | `g1` |
-| `policy` | 策略名称 | `motion` |
+| `robot` | 机型名称；wrapper 自动检查 `humanoid_<robot>` 与 `humanoid_unitree_<robot>` | 必填 |
+| `policy` | YAML 中的策略名称 | 必填 |
 | `--warmup N` | 预热轮数 | `100` |
 | `--rounds N` | 正式统计轮数 | `1000` |
-| `--hz N` | 目标控制频率，用于计算超时率 | `50` |
-| `--verbose` | 逐帧输出延迟 | 关闭 |
+| `--mode throughput\|periodic` | 背靠背吞吐或绝对时钟周期释放 | `throughput` |
+| `--hz N` | periodic 频率；未覆盖时读取 YAML `rl_policy.rl_dt` | YAML |
+| `--overrun drop\|backlog` | periodic 过载时丢过期 release 或保留 backlog | `drop` |
+| `--provider auto\|cpu\|spacemit` | ONNX provider；显式 spacemit 初始化失败会退出 | `auto` |
+| `--threads N` | CPU intra-op 或 SpaceMIT EP 线程数 | `1` |
+| `--ort-spinning on\|off` | 是否允许 ORT intra-op worker 在无任务时 busy-spin；用于周期负载 A/B | `on` |
+| `--affinity CPU_LIST` | 进程 affinity，例如 `0`、`0,1`；传给 EP 时自动转为官方分号格式 | 当前进程 mask |
+| `--ep-dump-subgraphs` | 导出 EP 实际编译子图，用于确认不是全量回退 CPU | 关闭 |
+| `--ep-profile PREFIX` | 导出 EP 执行 profile JSON | 关闭 |
+| `--csv PATH` | 保存逐轮原始数据 | 不保存 |
+| `--verbose` | 计时结束后输出逐轮数据，不干扰计时区间 | 关闭 |
 
-输出指标（Avg / Std / P50 / P95 / P99 / Max / Miss）含义见详细使用章节。
+`throughput` 模式只报告 service time/吞吐，不输出实时满足结论。`periodic`
+使用 `steady_clock::sleep_until` 绝对时间释放，记录 release jitter、service、
+release-to-done response、deadline lateness、miss、drop 和 backlog。RL 组件内没有
+真实传感器采样与电机下发时间戳，因此这里不能给出整机 action age。即使 periodic
+无 miss，也只证明当前 benchmark 边界，不证明整机实时性。P99.99 至少使用
+100000 轮，并必须通过 `--csv` 保留原始样本。
+
+`--ort-spinning off` 对应 ONNX Runtime 的
+`session.intra_op.allow_spinning=0`。它只控制 ORT intra-op 线程池，不控制
+SpaceMIT EP 自己的 worker；provider 为 `spacemit` 时不能据此推断 EP 已停止
+busy-spin。关闭后通常能降低周期调用之间的 CPU 占用，但可能增加 worker 唤醒
+延迟，因此报告必须同时比较 periodic 的 response/p99/max 与进程 CPU、调度等待。
+stdout 和 CSV 都会记录实际配置。
 
 ### CI 测试
 
@@ -223,7 +258,7 @@ policy.MapActionToTargetPos(action, target_pos);
 
 | 模式 | YAML 值 | 说明 | 典型场景 |
 |------|---------|------|----------|
-| **无历史** | 省略 `mode` 或 `mode: ""` | 输出当前帧的 obs terms | G1 motion、Tinker trot |
+| **无历史** | 省略 `mode` 或 `mode: ""` | 输出当前帧的 obs terms | G1 walk_rlgym、Tinker trot |
 | **flat_history** | `mode: flat_history` | 按变量分组的环形历史缓冲，同一 term 的多帧数据连续排列 | G1 dance/kungfu、青龙结构化历史 |
 | **frame_history** | `mode: frame_history` | 按帧的滑窗历史缓冲，每帧完整的 obs 连续排列 | 天工 walk、青龙滑窗历史 |
 
@@ -255,7 +290,7 @@ clip_actions: 100
 1. **观测维度匹配**：AssembleObs 输出维度必须等于 ObsDim()；若 strict_obs_dim_check = true，Infer 会严格验证
 2. **反馈状态生命周期**：若 FeedbackStateCount() > 0，需在多帧推理中保持执行器实例；重建执行器会把状态清零
 3. **自定义标量生命周期**：SetCustomScalar 后有效直至下次修改；建议在每个推理循环的 AssembleObs 前重新设置
-4. **运行时策略切换**：调用 `LoadPolicyConfigFromYaml(yaml_path, new_policy_name, robot_dir)` 加载新策略后，销毁旧 PolicyExecutor，创建新实例并 Init；FSM 负责管理切换时机
+4. **运行时策略切换**：调用 `LoadPolicyConfigFromYaml(yaml_path, new_policy_name, robot_dir)` 加载新策略后，销毁旧 PolicyExecutor，创建新实例并 Init；调用方负责管理切换时机
 5. **段式观测细节**：mode 为空表示无历史仅输出当前帧；flat_history 按变量分组；frame_history 按帧组织
 
 ## 常见问题

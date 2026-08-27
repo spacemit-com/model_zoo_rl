@@ -20,6 +20,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -332,12 +333,11 @@ class OnnxRuntimeClass::ImpClass {
 public:
     explicit ImpClass(OnnxRuntimeClass *omp);
     ~ImpClass();
-    bool Init(const std::string &model_file);
+    bool Init(const std::string &model_file, const RuntimeOptions &options);
     bool Step();
 
     OnnxRuntimeClass &omp;
     Ort::Env env;
-    Ort::SessionOptions session_options;
     std::unique_ptr<Ort::Session> session;
     Ort::AllocatorWithDefaultOptions allocator;
     std::vector<Ort::Value> inputs;
@@ -353,19 +353,106 @@ OnnxRuntimeClass::ImpClass::~ImpClass() {
     std::cout << "[ONNX Runtime] ImpClass 析构" << std::endl;
 }
 
-bool OnnxRuntimeClass::ImpClass::Init(const std::string &model_file) {
+bool OnnxRuntimeClass::ImpClass::Init(
+    const std::string &model_file, const RuntimeOptions &options) {
     std::cout << "[ONNX Runtime] 开始初始化模型: " << model_file << std::endl;
 
     try {
+        if (options.provider != "auto" && options.provider != "cpu" &&
+            options.provider != "spacemit") {
+            throw std::runtime_error(
+                "unsupported provider: " + options.provider +
+                " (expected auto|cpu|spacemit)");
+        }
+        if (options.threads <= 0) {
+            throw std::runtime_error("threads must be greater than zero");
+        }
+
+        omp.runtime_info_ = {};
+        omp.runtime_info_.requested_provider = options.provider;
+        omp.runtime_info_.affinity = options.affinity;
+        omp.runtime_info_.ort_inter_threads = 1;
+        omp.runtime_info_.ort_spinning = options.ort_spinning;
+
+        const auto make_options = [&options] {
+            auto value = std::make_unique<Ort::SessionOptions>();
+            value->SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+            value->SetInterOpNumThreads(1);
+            value->AddConfigEntry(
+                "session.intra_op.allow_spinning",
+                options.ort_spinning ? "1" : "0");
+            return value;
+        };
+        auto next_options = make_options();
+
+        bool request_spacemit = options.provider == "spacemit";
 #if defined(cpu_rv64) || defined(__riscv)
-        SessionOptionsSpaceMITEnvInit(session_options);
+        request_spacemit = request_spacemit || options.provider == "auto";
 #endif
-        session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        session_options.SetIntraOpNumThreads(1);
-        session_options.SetInterOpNumThreads(1);
+
+        if (request_spacemit) {
+#if defined(cpu_rv64) || defined(__riscv)
+            next_options->SetIntraOpNumThreads(1);
+            std::unordered_map<std::string, std::string> provider_options = {
+                {"SPACEMIT_EP_INTRA_THREAD_NUM", std::to_string(options.threads)},
+            };
+            if (!options.affinity.empty()) {
+                provider_options["SPACEMIT_EP_INTRA_THREAD_AFFINITY"] = options.affinity;
+            }
+            if (options.ep_dump_subgraphs) {
+                provider_options["SPACEMIT_EP_DUMP_SUBGRAPHS"] = "1";
+            }
+            if (!options.ep_profile_prefix.empty()) {
+                provider_options["SPACEMIT_EP_DEBUG_PROFILE"] = options.ep_profile_prefix;
+            }
+            const Ort::Status status =
+                Ort::SessionOptionsSpaceMITEnvInit(*next_options, provider_options);
+            if (!status.IsOK()) {
+                const std::string error = status.GetErrorMessage();
+                if (options.provider == "spacemit") {
+                    throw std::runtime_error("SpaceMIT EP init failed: " + error);
+                }
+                std::cerr << "[ONNX Runtime] SpaceMIT EP 初始化失败，auto 回退 CPU: "
+                    << error << std::endl;
+                next_options = make_options();
+                next_options->SetIntraOpNumThreads(options.threads);
+                omp.runtime_info_.initialized_provider = "cpu";
+                omp.runtime_info_.ort_intra_threads = options.threads;
+                omp.runtime_info_.provider_status =
+                    "SpaceMIT EP init failed; auto fallback to CPU: " + error;
+            } else {
+                omp.runtime_info_.initialized_provider = "spacemit-registered";
+                omp.runtime_info_.ort_intra_threads = 1;
+                omp.runtime_info_.ep_threads = options.threads;
+                omp.runtime_info_.provider_status =
+                    "SpaceMIT EP init OK; node assignment is not verified and CPU fallback is allowed";
+            }
+#else
+            throw std::runtime_error(
+                "SpaceMIT provider requested by a non-RISC-V build");
+#endif
+        } else {
+            next_options->SetIntraOpNumThreads(options.threads);
+            omp.runtime_info_.initialized_provider = "cpu";
+            omp.runtime_info_.ort_intra_threads = options.threads;
+            omp.runtime_info_.provider_status = "CPU provider selected";
+        }
+
+        std::cout << "[ONNX Runtime] provider requested="
+            << omp.runtime_info_.requested_provider
+            << ", initialized=" << omp.runtime_info_.initialized_provider
+            << ", ORT intra=" << omp.runtime_info_.ort_intra_threads
+            << ", ORT inter=" << omp.runtime_info_.ort_inter_threads
+            << ", EP threads requested=" << omp.runtime_info_.ep_threads
+            << ", ORT spinning="
+            << (omp.runtime_info_.ort_spinning ? "on" : "off")
+            << ", EP affinity requested="
+            << (omp.runtime_info_.affinity.empty()
+                    ? "not-set" : omp.runtime_info_.affinity)
+            << std::endl;
 
         auto next_session =
-            std::make_unique<Ort::Session>(env, model_file.c_str(), session_options);
+            std::make_unique<Ort::Session>(env, model_file.c_str(), *next_options);
         std::cout << "[ONNX Runtime] 模型加载成功" << std::endl;
 
         const std::size_t input_count = next_session->GetInputCount();
@@ -513,13 +600,18 @@ OnnxRuntimeClass::~OnnxRuntimeClass() {
 }
 
 bool OnnxRuntimeClass::Init(const std::string &model_file) {
+    return Init(model_file, RuntimeOptions{});
+}
+
+bool OnnxRuntimeClass::Init(
+    const std::string &model_file, const RuntimeOptions &options) {
     outputs_valid_ = false;
     if (!imp_) {
         last_error_ = "ImpClass 未初始化";
         std::cerr << "[ONNX Runtime] 错误: " << last_error_ << std::endl;
         return false;
     }
-    return imp_->Init(model_file);
+    return imp_->Init(model_file, options);
 }
 
 bool OnnxRuntimeClass::Run() {
@@ -533,6 +625,10 @@ bool OnnxRuntimeClass::Run() {
 
 const std::string &OnnxRuntimeClass::GetLastError() const {
     return last_error_;
+}
+
+const RuntimeInfo &OnnxRuntimeClass::GetRuntimeInfo() const {
+    return runtime_info_;
 }
 
 void OnnxRuntimeClass::EnsureOutputsValid() const {

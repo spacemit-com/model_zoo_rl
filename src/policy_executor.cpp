@@ -580,6 +580,19 @@ int PolicyExecutor::FeedbackStateCount() const {
 bool PolicyExecutor::HasObsHist() const {
     return impl_->has_obs_hist;
 }
+InferenceRuntimeInfo PolicyExecutor::GetRuntimeInfo() const {
+    const auto &runtime = impl_->onnx.GetRuntimeInfo();
+    InferenceRuntimeInfo info;
+    info.requested_provider = runtime.requested_provider;
+    info.initialized_provider = runtime.initialized_provider;
+    info.ort_intra_threads = runtime.ort_intra_threads;
+    info.ort_inter_threads = runtime.ort_inter_threads;
+    info.ep_threads = runtime.ep_threads;
+    info.affinity = runtime.affinity;
+    info.provider_status = runtime.provider_status;
+    info.ort_spinning = runtime.ort_spinning;
+    return info;
+}
 void PolicyExecutor::PrintModelInfo() const {
     impl_->onnx.PrintModelInfo();
 }
@@ -691,8 +704,17 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     }
 
     // ---- 模型加载 ----
-    if (!impl_->onnx.Init(cfg.model_path)) {
-        throw std::runtime_error("[PolicyExecutor] 模型初始化失败: " + cfg.model_path);
+    onnx_runtime::RuntimeOptions runtime_options;
+    runtime_options.provider = cfg.runtime.provider;
+    runtime_options.threads = cfg.runtime.threads;
+    runtime_options.affinity = cfg.runtime.affinity;
+    runtime_options.ep_dump_subgraphs = cfg.runtime.ep_dump_subgraphs;
+    runtime_options.ep_profile_prefix = cfg.runtime.ep_profile_prefix;
+    runtime_options.ort_spinning = cfg.runtime.ort_spinning;
+    if (!impl_->onnx.Init(cfg.model_path, runtime_options)) {
+        throw std::runtime_error(
+            "[PolicyExecutor] 模型初始化失败: " + cfg.model_path + ", " +
+            impl_->onnx.GetLastError());
     }
     impl_->onnx.PrintModelInfo();
 
