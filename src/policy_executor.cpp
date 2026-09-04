@@ -880,6 +880,12 @@ void PolicyExecutor::AssembleObs(const std::array<double, 3> &gyro,
 // ============================================================
 
 void PolicyExecutor::Infer(const Eigen::VectorXf &obs, std::vector<double> &out_action) {
+    Infer(obs, out_action, nullptr);
+}
+
+void PolicyExecutor::Infer(const Eigen::VectorXf &obs,
+                            std::vector<double> &out_action,
+                            std::vector<double> *raw_action) {
     if (!impl_->initialized) {
         throw std::runtime_error("[PolicyExecutor] 未初始化");
     }
@@ -948,6 +954,12 @@ void PolicyExecutor::Infer(const Eigen::VectorXf &obs, std::vector<double> &out_
     impl_->outputs_ready = true;
 
     const auto &out = impl_->onnx.GetOutput(impl_->action_output_index);
+    if (raw_action) {
+        raw_action->resize(out.size());
+        for (int i = 0; i < out.size(); ++i) {
+            (*raw_action)[i] = static_cast<double>(out[i]);
+        }
+    }
     out_action.resize(out.size());
     const double blend = impl_->cfg.action_blend_ratio;
     for (int i = 0; i < out.size(); ++i) {

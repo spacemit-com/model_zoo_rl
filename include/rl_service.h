@@ -385,6 +385,15 @@ public:
     /** 按 model_io 绑定执行推理 */
     void Infer(const Eigen::VectorXf &obs, std::vector<double> &out_action);
 
+    /**
+     * @brief 执行推理，并可同时返回动作裁剪和平滑前的 ONNX 原始输出
+     * @param obs 组装后的观测向量
+     * @param out_action 经过 clip_actions 和 action_blend_ratio 后的动作
+     * @param raw_action ONNX action 输出；必须与 out_action 使用不同容器
+    */
+    void Infer(const Eigen::VectorXf &obs, std::vector<double> &out_action,
+                std::vector<double> *raw_action);
+
     /** 将策略动作映射为全身关节目标位置 */
     void MapActionToTargetPos(const std::vector<double> &action,
                             std::vector<double> &target_pos) const;
