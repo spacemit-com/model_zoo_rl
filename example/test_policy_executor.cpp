@@ -294,7 +294,11 @@ int main(int argc, char *argv[]) {
 
             // 推理
             std::vector<double> action;
-            policy.Infer(obs, action);
+            std::vector<double> raw_action;
+            policy.Infer(obs, action, &raw_action);
+            if (raw_action.size() != action.size()) {
+                throw std::runtime_error("原始动作与实际动作维度不一致");
+            }
             ValidateActionClip(action, loaded_cfg.exec_cfg.clip_actions);
             ValidateExposedOutputs(policy, loaded_cfg.exec_cfg.model_io);
 
