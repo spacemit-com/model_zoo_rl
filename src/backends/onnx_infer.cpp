@@ -335,10 +335,12 @@ public:
     ~ImpClass();
     bool Init(const std::string &model_file, const RuntimeOptions &options);
     bool Step();
+    void RequestTerminate();
 
     OnnxRuntimeClass &omp;
     Ort::Env env;
     std::unique_ptr<Ort::Session> session;
+    Ort::RunOptions run_options;
     Ort::AllocatorWithDefaultOptions allocator;
     std::vector<Ort::Value> inputs;
     std::vector<Ort::Value> outputs;
@@ -358,6 +360,7 @@ bool OnnxRuntimeClass::ImpClass::Init(
     std::cout << "[ONNX Runtime] 开始初始化模型: " << model_file << std::endl;
 
     try {
+        run_options.UnsetTerminate();
         if (options.provider != "auto" && options.provider != "cpu" &&
             options.provider != "spacemit") {
             throw std::runtime_error(
@@ -545,7 +548,6 @@ bool OnnxRuntimeClass::ImpClass::Step() {
         output_names.reserve(omp.output_infos_.size());
         for (const auto &info : omp.output_infos_) output_names.push_back(info.name.c_str());
 
-        Ort::RunOptions run_options;
         auto next_outputs = session->Run(
             run_options,
             input_names.data(),
@@ -591,6 +593,10 @@ bool OnnxRuntimeClass::ImpClass::Step() {
     return false;
 }
 
+void OnnxRuntimeClass::ImpClass::RequestTerminate() {
+    run_options.SetTerminate();
+}
+
 OnnxRuntimeClass::OnnxRuntimeClass() : imp_(std::make_unique<ImpClass>(this)) {
     std::cout << "[ONNX Runtime] OnnxRuntimeClass 构造" << std::endl;
 }
@@ -621,6 +627,10 @@ bool OnnxRuntimeClass::Run() {
         return false;
     }
     return imp_->Step();
+}
+
+void OnnxRuntimeClass::RequestTerminate() {
+    if (imp_) imp_->RequestTerminate();
 }
 
 const std::string &OnnxRuntimeClass::GetLastError() const {

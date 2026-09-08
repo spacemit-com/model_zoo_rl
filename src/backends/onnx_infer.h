@@ -116,6 +116,9 @@ public:
      */
     bool Run();
 
+    /** @brief 请求中断当前使用本实例 RunOptions 执行的推理。 */
+    void RequestTerminate();
+
     /** @return 最近一次初始化或推理失败的错误信息 */
     const std::string &GetLastError() const;
 

@@ -203,6 +203,7 @@ scripts/test/robot-test run  components/model_zoo/rl --scope scheduled # 真模�
 | `GetModelOutputTensor` | `key → TensorView` | 读取保留原生 dtype 的 `target: expose` 输出 |
 | `AssembleObs` | 传感器数据 → `Eigen::VectorXf &out_obs` | 组装观测向量：计算各段、交给对应处理器、拼接输出 |
 | `Infer` | `const Eigen::VectorXf &obs` → `std::vector<double> &action` | 按声明绑定输入、执行推理、反馈状态并处理输出 |
+| `RequestInferenceTermination` | `void` | 中止当前正在执行的推理；再次使用执行器前必须重新调用 `Init` |
 | `MapActionToTargetPos` | `const std::vector<double> &action` → `std::vector<double> &target_pos` | 将策略动作映射为全身关节目标位置 |
 
 #### 核心数据结构

@@ -394,6 +394,9 @@ public:
     void Infer(const Eigen::VectorXf &obs, std::vector<double> &out_action,
                 std::vector<double> *raw_action);
 
+    /** 请求中断当前正在执行的 ONNX 推理。 */
+    void RequestInferenceTermination();
+
     /** 将策略动作映射为全身关节目标位置 */
     void MapActionToTargetPos(const std::vector<double> &action,
                             std::vector<double> &target_pos) const;

@@ -974,6 +974,10 @@ void PolicyExecutor::Infer(const Eigen::VectorXf &obs,
     }
 }
 
+void PolicyExecutor::RequestInferenceTermination() {
+    impl_->onnx.RequestTerminate();
+}
+
 // ============================================================
 // MapActionToTargetPos
 // ============================================================
