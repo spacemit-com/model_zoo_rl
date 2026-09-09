@@ -96,6 +96,19 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
     }
 
     LoadedPolicyConfig out;
+    const auto runtime = policy["runtime"];
+    if (runtime) {
+        if (!runtime.IsMap()) {
+            throw std::runtime_error("[PolicyConfigLoader] runtime 必须是 map");
+        }
+        out.exec_cfg.runtime.provider =
+            NodeAs(runtime["provider"], out.exec_cfg.runtime.provider);
+        const auto &provider = out.exec_cfg.runtime.provider;
+        if (provider != "auto" && provider != "cpu" && provider != "spacemit") {
+            throw std::runtime_error(
+                "[PolicyConfigLoader] runtime.provider 必须是 auto、cpu 或 spacemit: " + provider);
+        }
+    }
     out.rl_dt = NodeAs(cfg["rl_policy"]["rl_dt"], 0.02);
     if (!std::isfinite(out.rl_dt) || out.rl_dt <= 0.0) {
         throw std::runtime_error("[PolicyConfigLoader] rl_policy.rl_dt 必须是正数");

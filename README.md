@@ -255,6 +255,19 @@ std::vector<double> target_pos;
 policy.MapActionToTargetPos(action, target_pos);
 ```
 
+#### 推理后端选择
+
+每个策略可通过 `rl_policy.onnx_infer.policies.<name>.runtime.provider` 选择后端：
+
+```yaml
+runtime:
+  provider: cpu
+```
+
+可选值为 `auto`、`cpu`、`spacemit`，默认 `auto`。`auto` 在 RISC-V 上优先启用
+SpaceMIT EP，其他架构使用 CPU；`cpu` 不注册 EP。benchmark 的 `--provider`
+参数独立选择测试后端，默认仍为 `auto`。
+
 #### 观测历史模式说明
 
 | 模式 | YAML 值 | 说明 | 典型场景 |
