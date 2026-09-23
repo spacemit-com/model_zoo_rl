@@ -103,10 +103,22 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
         }
         out.exec_cfg.runtime.provider =
             NodeAs(runtime["provider"], out.exec_cfg.runtime.provider);
+        out.exec_cfg.runtime.threads =
+            NodeAs(runtime["threads"], out.exec_cfg.runtime.threads);
+        out.exec_cfg.runtime.warmup_runs =
+            NodeAs(runtime["warmup_runs"], out.exec_cfg.runtime.warmup_runs);
         const auto &provider = out.exec_cfg.runtime.provider;
         if (provider != "auto" && provider != "cpu" && provider != "spacemit") {
             throw std::runtime_error(
                 "[PolicyConfigLoader] runtime.provider 必须是 auto、cpu 或 spacemit: " + provider);
+        }
+        if (out.exec_cfg.runtime.threads <= 0) {
+            throw std::runtime_error(
+                "[PolicyConfigLoader] runtime.threads 必须是正整数");
+        }
+        if (out.exec_cfg.runtime.warmup_runs < 0) {
+            throw std::runtime_error(
+                "[PolicyConfigLoader] runtime.warmup_runs 不能为负数");
         }
     }
     out.rl_dt = NodeAs(cfg["rl_policy"]["rl_dt"], 0.02);

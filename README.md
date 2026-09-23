@@ -262,11 +262,20 @@ policy.MapActionToTargetPos(action, target_pos);
 ```yaml
 runtime:
   provider: cpu
+  threads: 4
+  warmup_runs: 1
 ```
 
 可选值为 `auto`、`cpu`、`spacemit`，默认 `auto`。`auto` 在 RISC-V 上优先启用
 SpaceMIT EP，其他架构使用 CPU；`cpu` 不注册 EP。benchmark 的 `--provider`
-参数独立选择测试后端，默认仍为 `auto`。
+参数独立选择测试后端，默认仍为 `auto`。`threads` 必须为正整数，CPU 后端将其
+作为 ONNX Runtime intra-op 线程数，SpaceMIT EP 将其作为 EP 请求线程数；未配置时
+保持默认值 `1`。推理线程的 CPU 亲和性由上层 `robot_base.threads.rl_infer.cpu_affinity`
+配置。应在实际控制与仿真负载下验证多线程配置是否满足闭环时限，不能仅凭固定输入
+benchmark 判断。
+`warmup_runs` 默认为 `0`。非零时在策略准备阶段用各输入的已配置初值（没有初值的
+输入保持原生零缓冲）执行指定次数，只用于触发后端编译和缓存；预热输出不会回灌
+feedback，也不会推进动作、观测历史或 external 输入状态。模型不接受零输入时不要启用。
 
 #### 观测历史模式说明
 

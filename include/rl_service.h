@@ -178,6 +178,7 @@ struct ModelIOConfig {
 struct InferenceRuntimeConfig {
     std::string provider = "auto";  ///< auto | cpu | spacemit
     int threads = 1;                ///< CPU intra-op 或 SpaceMIT EP 线程数
+    int warmup_runs = 0;            ///< 会话初始化后、策略接管前的预热次数
     std::string affinity;           ///< SpaceMIT EP CPU 列表，分号分隔，例如 "0;1"
     bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
     std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON

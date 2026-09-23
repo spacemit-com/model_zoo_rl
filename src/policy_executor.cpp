@@ -816,6 +816,20 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
                 << std::endl;
     }
 
+    if (cfg.runtime.warmup_runs > 0) {
+        std::cout << "[PolicyExecutor] 模型预热: "
+            << cfg.runtime.warmup_runs << " 次" << std::endl;
+        for (int run = 0; run < cfg.runtime.warmup_runs; ++run) {
+            if (!impl_->onnx.Run()) {
+                throw std::runtime_error(
+                    "[PolicyExecutor] 模型预热失败: " + impl_->onnx.GetLastError());
+            }
+        }
+        // 预热只触发后端编译/缓存。不要把预热输出暴露给上层，也不要推进
+        // feedback、last_action、observation history 或 external ready 状态。
+        impl_->outputs_ready = false;
+    }
+
     impl_->initialized = true;
 }
 
