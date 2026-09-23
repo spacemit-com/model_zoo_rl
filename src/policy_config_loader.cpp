@@ -96,6 +96,10 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
     }
 
     LoadedPolicyConfig out;
+    out.exec_cfg.backend = NodeAs(policy["backend"], std::string("onnx"));
+    if (out.exec_cfg.backend != "onnx" && out.exec_cfg.backend != "mnn") {
+        throw std::runtime_error("[PolicyConfigLoader] backend 必须是 onnx 或 mnn");
+    }
     const auto runtime = policy["runtime"];
     if (runtime) {
         if (!runtime.IsMap()) {
@@ -108,6 +112,10 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
             throw std::runtime_error(
                 "[PolicyConfigLoader] runtime.provider 必须是 auto、cpu 或 spacemit: " + provider);
         }
+        if (out.exec_cfg.backend == "mnn" && provider == "spacemit") {
+            throw std::runtime_error(
+                "[PolicyConfigLoader] MNN backend only supports runtime.provider auto or cpu");
+        }
     }
     out.rl_dt = NodeAs(cfg["rl_policy"]["rl_dt"], 0.02);
     if (!std::isfinite(out.rl_dt) || out.rl_dt <= 0.0) {
@@ -117,7 +125,7 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
     out.exec_cfg.model_path =
         fs::weakly_canonical(robot_dir_path / policy["model_path"].as<std::string>()).string();
     if (!fs::exists(out.exec_cfg.model_path)) {
-        throw std::runtime_error("[PolicyConfigLoader] ONNX 模型文件不存在: " +
+        throw std::runtime_error("[PolicyConfigLoader] 模型文件不存在: " +
                                 out.exec_cfg.model_path);
     }
 

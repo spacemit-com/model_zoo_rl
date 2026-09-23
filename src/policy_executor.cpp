@@ -29,9 +29,255 @@
 #include "obs_none.h"
 #include "obs_term.h"
 #include "onnx_infer.h"
+#ifdef USE_MNN_BACKEND
+#include "mnn_infer.h"
+#endif
 #include "rl_service.h"
 
 namespace rl_policy {
+
+namespace {
+
+#ifdef USE_MNN_BACKEND
+onnx_runtime::TensorElementType FromMnnTensorType(mnn_runtime::TensorElementType type) {
+    using MnnType = mnn_runtime::TensorElementType;
+    using OnnxType = onnx_runtime::TensorElementType;
+    switch (type) {
+    case MnnType::FLOAT32: return OnnxType::FLOAT32;
+    case MnnType::UINT8: return OnnxType::UINT8;
+    case MnnType::INT8: return OnnxType::INT8;
+    case MnnType::UINT16: return OnnxType::UINT16;
+    case MnnType::INT16: return OnnxType::INT16;
+    case MnnType::INT32: return OnnxType::INT32;
+    case MnnType::INT64: return OnnxType::INT64;
+    case MnnType::BOOL: return OnnxType::BOOL;
+    case MnnType::FLOAT16: return OnnxType::FLOAT16;
+    case MnnType::FLOAT64: return OnnxType::FLOAT64;
+    case MnnType::UINT32: return OnnxType::UINT32;
+    case MnnType::UINT64: return OnnxType::UINT64;
+    default: throw std::invalid_argument("unsupported MNN tensor dtype");
+    }
+}
+#endif
+
+// Keep the backend adapter private to the policy executor; it is not part of
+// the model_zoo public or shared internal header surface.
+class PolicyModelRuntime {
+public:
+    bool Init(const std::string &path, const onnx_runtime::RuntimeOptions &options,
+            const std::string &backend);
+    bool Run();
+    void RequestTerminate();
+    const std::string &GetLastError() const;
+    const onnx_runtime::RuntimeInfo &GetRuntimeInfo() const;
+    int GetInputCount() const;
+    int GetOutputCount() const;
+    const onnx_runtime::TensorInfo &GetInputInfo(int index) const;
+    const onnx_runtime::TensorInfo &GetOutputInfo(int index) const;
+    void SetInputFromFloat(int index, const float *data, std::size_t count);
+    bool CanSetInputFromFloat(int index) const;
+    void SetInput(int index, const onnx_runtime::TensorView &input);
+    const std::vector<float> &GetOutput(int index) const;
+    bool CanGetOutputAsFloat(int index) const;
+    onnx_runtime::TensorView GetOutputView(int index) const;
+    void CopyOutputToInput(int output_index, int input_index);
+    void PrintModelInfo() const;
+
+private:
+#ifdef USE_MNN_BACKEND
+    static onnx_runtime::TensorInfo ConvertInfo(const mnn_runtime::TensorInfo &info);
+#endif
+    bool use_mnn_ = false;
+    onnx_runtime::OnnxRuntimeClass onnx_;
+    std::vector<onnx_runtime::TensorInfo> input_infos_;
+    std::vector<onnx_runtime::TensorInfo> output_infos_;
+    onnx_runtime::RuntimeInfo runtime_info_;
+#ifdef USE_MNN_BACKEND
+    mnn_runtime::MnnRuntimeClass mnn_;
+#endif
+};
+
+bool PolicyModelRuntime::Init(const std::string &path,
+        const onnx_runtime::RuntimeOptions &options, const std::string &backend) {
+    if (backend != "onnx" && backend != "mnn") {
+        throw std::invalid_argument("unknown inference backend: " + backend);
+    }
+    use_mnn_ = backend == "mnn";
+    if (!use_mnn_) return onnx_.Init(path, options);
+#ifdef USE_MNN_BACKEND
+    if (options.provider != "auto" && options.provider != "cpu") {
+        throw std::invalid_argument("MNN supports only auto or cpu provider");
+    }
+    if (!options.affinity.empty() || options.ep_dump_subgraphs ||
+        !options.ep_profile_prefix.empty()) {
+        throw std::invalid_argument("MNN does not support ONNX provider options");
+    }
+    mnn_runtime::RuntimeOptions mnn_options;
+    mnn_options.backend = options.provider;
+    mnn_options.threads = options.threads;
+    if (!mnn_.Init(path, mnn_options)) return false;
+    input_infos_.clear();
+    output_infos_.clear();
+    for (int i = 0; i < mnn_.GetInputCount(); ++i) {
+        input_infos_.push_back(ConvertInfo(mnn_.GetInputInfo(i)));
+    }
+    for (int i = 0; i < mnn_.GetOutputCount(); ++i) {
+        output_infos_.push_back(ConvertInfo(mnn_.GetOutputInfo(i)));
+    }
+    const auto &runtime = mnn_.GetRuntimeInfo();
+    runtime_info_.requested_provider = runtime.requested_backend;
+    runtime_info_.initialized_provider = "mnn:" + runtime.initialized_backend;
+    runtime_info_.ort_intra_threads = runtime.threads;
+    runtime_info_.ort_spinning = false;
+    runtime_info_.provider_status = runtime.backend_status;
+    return true;
+#else
+    throw std::runtime_error("MNN backend was not built; enable USE_MNN_BACKEND and configure MNN_ROOT");
+#endif
+}
+
+bool PolicyModelRuntime::Run() {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return mnn_.Run();
+#endif
+    return onnx_.Run();
+}
+
+void PolicyModelRuntime::RequestTerminate() {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) {
+        mnn_.RequestTerminate();
+        return;
+    }
+#endif
+    onnx_.RequestTerminate();
+}
+
+const std::string &PolicyModelRuntime::GetLastError() const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return mnn_.GetLastError();
+#endif
+    return onnx_.GetLastError();
+}
+
+const onnx_runtime::RuntimeInfo &PolicyModelRuntime::GetRuntimeInfo() const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return runtime_info_;
+#endif
+    return onnx_.GetRuntimeInfo();
+}
+
+int PolicyModelRuntime::GetInputCount() const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return static_cast<int>(input_infos_.size());
+#endif
+    return onnx_.GetInputCount();
+}
+
+int PolicyModelRuntime::GetOutputCount() const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return static_cast<int>(output_infos_.size());
+#endif
+    return onnx_.GetOutputCount();
+}
+
+const onnx_runtime::TensorInfo &PolicyModelRuntime::GetInputInfo(int index) const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return input_infos_.at(static_cast<std::size_t>(index));
+#endif
+    return onnx_.GetInputInfo(index);
+}
+
+const onnx_runtime::TensorInfo &PolicyModelRuntime::GetOutputInfo(int index) const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return output_infos_.at(static_cast<std::size_t>(index));
+#endif
+    return onnx_.GetOutputInfo(index);
+}
+
+void PolicyModelRuntime::SetInputFromFloat(int index, const float *data, std::size_t count) {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) {
+        mnn_.SetInputFromFloat(index, data, count);
+        return;
+    }
+#endif
+    onnx_.SetInputFromFloat(index, data, count);
+}
+
+bool PolicyModelRuntime::CanSetInputFromFloat(int index) const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return mnn_.CanSetInputFromFloat(index);
+#endif
+    return onnx_.CanSetInputFromFloat(index);
+}
+
+void PolicyModelRuntime::SetInput(int index, const onnx_runtime::TensorView &input) {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) {
+        const auto type = mnn_.GetInputInfo(index).element_type;
+        if (input.element_type != FromMnnTensorType(type)) {
+            throw std::invalid_argument("input tensor dtype mismatch for MNN");
+        }
+        mnn_.SetInput(index, {type,
+            input.data, input.element_count, input.byte_count});
+        return;
+    }
+#endif
+    onnx_.SetInput(index, input);
+}
+
+const std::vector<float> &PolicyModelRuntime::GetOutput(int index) const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return mnn_.GetOutput(index);
+#endif
+    return onnx_.GetOutput(index);
+}
+
+bool PolicyModelRuntime::CanGetOutputAsFloat(int index) const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return mnn_.CanGetOutputAsFloat(index);
+#endif
+    return onnx_.CanGetOutputAsFloat(index);
+}
+
+onnx_runtime::TensorView PolicyModelRuntime::GetOutputView(int index) const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) {
+        const auto output = mnn_.GetOutputView(index);
+        return {FromMnnTensorType(output.element_type),
+            output.data, output.element_count, output.byte_count};
+    }
+#endif
+    return onnx_.GetOutputView(index);
+}
+
+void PolicyModelRuntime::CopyOutputToInput(int output_index, int input_index) {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) {
+        mnn_.CopyOutputToInput(output_index, input_index);
+        return;
+    }
+#endif
+    onnx_.CopyOutputToInput(output_index, input_index);
+}
+
+void PolicyModelRuntime::PrintModelInfo() const {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) return mnn_.PrintModelInfo();
+#endif
+    onnx_.PrintModelInfo();
+}
+
+#ifdef USE_MNN_BACKEND
+onnx_runtime::TensorInfo PolicyModelRuntime::ConvertInfo(const mnn_runtime::TensorInfo &info) {
+    return {info.name, info.shape, info.total_size,
+        FromMnnTensorType(info.element_type),
+        info.element_type_name};
+}
+#endif
+
+}  // namespace
 
 // ============================================================
 // 工厂函数：根据 mode 创建对应的 assembler
@@ -57,7 +303,7 @@ static std::unique_ptr<ObsSegmentAssembler> CreateAssembler(const std::string &m
 class PolicyExecutor::Impl {
 public:
     PolicyExecutorConfig cfg;
-    onnx_runtime::OnnxRuntimeClass onnx;
+    PolicyModelRuntime onnx;
     ObsTermCalculator term_calc;
 
     struct SegmentRuntime {
@@ -181,7 +427,7 @@ void ValidateBatchOne(
 }
 
 void ValidateFloatInput(
-    const onnx_runtime::OnnxRuntimeClass &onnx,
+    const PolicyModelRuntime &onnx,
     int input_index,
     const std::string &source) {
     if (!onnx.CanSetInputFromFloat(input_index)) {
@@ -711,7 +957,7 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     runtime_options.ep_dump_subgraphs = cfg.runtime.ep_dump_subgraphs;
     runtime_options.ep_profile_prefix = cfg.runtime.ep_profile_prefix;
     runtime_options.ort_spinning = cfg.runtime.ort_spinning;
-    if (!impl_->onnx.Init(cfg.model_path, runtime_options)) {
+    if (!impl_->onnx.Init(cfg.model_path, runtime_options, cfg.backend)) {
         throw std::runtime_error(
             "[PolicyExecutor] 模型初始化失败: " + cfg.model_path + ", " +
             impl_->onnx.GetLastError());
@@ -942,7 +1188,7 @@ void PolicyExecutor::Infer(const Eigen::VectorXf &obs,
 
     if (!impl_->onnx.Run()) {
         throw std::runtime_error(
-            "[PolicyExecutor] ONNX 推理失败: " + impl_->onnx.GetLastError());
+            "[PolicyExecutor] 推理失败: " + impl_->onnx.GetLastError());
     }
 
     for (auto &runtime : impl_->input_bindings) {
@@ -956,19 +1202,19 @@ void PolicyExecutor::Infer(const Eigen::VectorXf &obs,
     const auto &out = impl_->onnx.GetOutput(impl_->action_output_index);
     if (raw_action) {
         raw_action->resize(out.size());
-        for (int i = 0; i < out.size(); ++i) {
+        for (std::size_t i = 0; i < out.size(); ++i) {
             (*raw_action)[i] = static_cast<double>(out[i]);
         }
     }
     out_action.resize(out.size());
     const double blend = impl_->cfg.action_blend_ratio;
-    for (int i = 0; i < out.size(); ++i) {
-        const double raw = static_cast<double>(ClipValue(out[i], impl_->cfg.clip_actions, i));
-        const double prev =
-            (i < static_cast<int>(impl_->blended_action.size())) ? impl_->blended_action[i] : 0.0;
+    for (std::size_t i = 0; i < out.size(); ++i) {
+        const double raw = static_cast<double>(ClipValue(
+            out[i], impl_->cfg.clip_actions, static_cast<int>(i)));
+        const double prev = i < impl_->blended_action.size() ? impl_->blended_action[i] : 0.0;
         const double blended = blend * raw + (1.0 - blend) * prev;
         out_action[i] = blended;
-        if (i < static_cast<int>(impl_->blended_action.size())) {
+        if (i < impl_->blended_action.size()) {
             impl_->blended_action[i] = blended;
         }
     }

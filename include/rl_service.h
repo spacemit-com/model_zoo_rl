@@ -6,7 +6,7 @@
  * @brief RL 策略执行器公共接口
  *
  * rl_service 是 rl 模块的对外统一接口：
- *   - 模型加载（内部委托推理后端，当前支持 ONNX Runtime）
+ *   - 模型加载（内部委托 ONNX Runtime 或可选 MNN 后端）
  *   - 段式观测组装（通过可插拔的 ObsSegmentAssembler 策略）
  *   - 声明式模型 I/O 绑定与推理执行
  *   - 动作映射
@@ -174,7 +174,7 @@ struct ModelIOConfig {
     std::vector<ModelOutputBindingConfig> outputs;
 };
 
-/** @brief ONNX Runtime provider 与线程配置。 */
+/** @brief 推理 provider 与线程配置。 */
 struct InferenceRuntimeConfig {
     std::string provider = "auto";  ///< auto | cpu | spacemit
     int threads = 1;                ///< CPU intra-op 或 SpaceMIT EP 线程数
@@ -202,6 +202,7 @@ struct InferenceRuntimeInfo {
 
 struct PolicyExecutorConfig {
     // ---- 模型与动作 ----
+    std::string backend = "onnx";  ///< onnx | mnn
     std::string model_path;
     std::vector<double> action_scale = {0.25};
     double action_blend_ratio = 1.0;
@@ -394,7 +395,7 @@ public:
     void Infer(const Eigen::VectorXf &obs, std::vector<double> &out_action,
                 std::vector<double> *raw_action);
 
-    /** 请求中断当前正在执行的 ONNX 推理。 */
+    /** 请求中断当前正在执行的推理。 */
     void RequestInferenceTermination();
 
     /** 将策略动作映射为全身关节目标位置 */

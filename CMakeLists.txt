@@ -30,6 +30,27 @@ find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 include(cmake/FindONNXRuntime.cmake)
 
+# MNN is optional so existing ONNX-only builds keep the original dependency set.
+option(USE_MNN_BACKEND "Enable MNN inference backend" OFF)
+set(MNN_FOUND FALSE)
+if(USE_MNN_BACKEND)
+    if(NOT DEFINED MNN_ROOT AND DEFINED ENV{MNN_ROOT})
+        set(MNN_ROOT "$ENV{MNN_ROOT}")
+    endif()
+    if(MNN_ROOT)
+        unset(MNN_LIB CACHE)
+        unset(MNN_INCLUDE_DIR CACHE)
+        find_library(MNN_LIB NAMES MNN PATHS "${MNN_ROOT}/lib" NO_DEFAULT_PATH)
+        find_path(MNN_INCLUDE_DIR NAMES MNN/Interpreter.hpp
+            PATHS "${MNN_ROOT}/include" NO_DEFAULT_PATH)
+        if(MNN_LIB AND MNN_INCLUDE_DIR)
+            set(MNN_FOUND TRUE)
+        else()
+            message(WARNING "MNN not found in MNN_ROOT=${MNN_ROOT}, backend disabled")
+        endif()
+    endif()
+endif()
+
 option(BUILD_EXAMPLES "Build example programs" ON)
 
 # ============================================================================
@@ -43,8 +64,18 @@ add_library(rl SHARED
     src/obs_term.cpp
     src/policy_config_loader.cpp
     src/policy_executor.cpp
-    src/backends/onnx_infer.cpp
+    src/backends/onnx/onnx_infer.cpp
 )
+
+if(MNN_FOUND)
+    target_sources(rl PRIVATE src/backends/mnn/mnn_infer.cpp)
+    target_include_directories(rl PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/mnn
+        ${MNN_INCLUDE_DIR}
+    )
+    target_link_libraries(rl PRIVATE ${MNN_LIB})
+    target_compile_definitions(rl PRIVATE USE_MNN_BACKEND)
+endif()
 
 # PUBLIC：调用方 #include "rl_service.h" 时需要 Eigen 头文件
 target_include_directories(rl
@@ -53,7 +84,7 @@ target_include_directories(rl
         $<INSTALL_INTERFACE:include>
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/onnx
         ${ONNXRUNTIME_INCLUDE_DIR}
 )
 
@@ -112,6 +143,17 @@ if(NOT _ort_lib_dir MATCHES "^/usr")
     message(STATUS "  installing onnxruntime libs to staging: ${_ort_lib_dir}")
 endif()
 
+# MNN_ROOT may point to a standalone SDK rather than a system package. Keep its
+# runtime library beside librl.so so the existing $ORIGIN staging RPATH works.
+if(MNN_FOUND)
+    get_filename_component(_mnn_lib_dir "${MNN_LIB}" DIRECTORY)
+    if(NOT _mnn_lib_dir MATCHES "^/usr")
+        file(GLOB _mnn_so_files "${_mnn_lib_dir}/libMNN.so*")
+        install(FILES ${_mnn_so_files} DESTINATION lib)
+        message(STATUS "  installing MNN libs to staging: ${_mnn_lib_dir}")
+    endif()
+endif()
+
 # ============================================================================
 # 示例
 # ============================================================================
@@ -135,12 +177,22 @@ if(BUILD_EXAMPLES)
     target_include_directories(test_onnx_infer PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/onnx
     )
     set_target_properties(test_onnx_infer PROPERTIES
         BUILD_RPATH_USE_ORIGIN ON
     )
     install(TARGETS test_onnx_infer RUNTIME DESTINATION bin)
+
+    if(MNN_FOUND)
+        add_executable(test_mnn_infer example/test_mnn_infer.cpp)
+        target_link_libraries(test_mnn_infer PRIVATE rl)
+        target_include_directories(test_mnn_infer PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/mnn
+        )
+        set_target_properties(test_mnn_infer PROPERTIES BUILD_RPATH_USE_ORIGIN ON)
+        install(TARGETS test_mnn_infer RUNTIME DESTINATION bin)
+    endif()
 
     # 性能基准测试：纯推理（隔离 ONNX Runtime 性能，排除 obs 组装/动作映射干扰）
     add_executable(benchmark_onnx_infer example/benchmark_onnx_infer.cpp)
@@ -148,7 +200,7 @@ if(BUILD_EXAMPLES)
     target_include_directories(benchmark_onnx_infer PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/backends/onnx
     )
     set_target_properties(benchmark_onnx_infer PROPERTIES
         BUILD_RPATH_USE_ORIGIN ON

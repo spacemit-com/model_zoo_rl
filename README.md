@@ -2,7 +2,7 @@
 
 ## 项目简介
 
-RL 策略推理执行器，负责 YAML 配置解析、观测组装、ONNX 推理与动作映射。模块设计与机器人型号无关，完全由 YAML 驱动。
+RL 策略推理执行器，负责 YAML 配置解析、观测组装、模型推理与动作映射。模块设计与机器人型号无关，完全由 YAML 驱动。
 
 ## 功能特性
 
@@ -18,7 +18,7 @@ RL 策略推理执行器，负责 YAML 配置解析、观测组装、ONNX 推理
 - observation/action clip，以及 scale、blend、default_pos 动作映射
 
 **不支持：**
-- PyTorch 原生推理（需先转换为 ONNX）
+- PyTorch 原生推理（需先转换为 ONNX 或 MNN）
 - ONNX `string` / `complex` 外部 I/O、静态 batch>1、运行时改变 shape
 - FP8/INT4 的 float 语义自动转换；这类类型仅支持原生 packed `TensorView`
 - 多个 action head、随机分布采样和非关节位置 action 语义
@@ -46,6 +46,16 @@ ONNX Runtime 由 CMake 处理。CMake 按以下顺序查找，命中即用：
 > 离线/受限网络环境可设 `SROBOTIS_THIRDPARTY_FETCH_OFF=ON` 禁用第 5 步拉取，并通过
 > `export ONNXRUNTIME_DIR=/path/to/onnxruntime` 指向预先下载好的目录。其他版本（≥ 1.17）见
 > [github.com/microsoft/onnxruntime/releases](https://github.com/microsoft/onnxruntime/releases)。
+
+MNN 后端默认关闭。需要时显式设置 `USE_MNN_BACKEND=ON`，并设置 `MNN_ROOT` 指向同时包含
+`include/MNN/Interpreter.hpp` 和 `lib/libMNN.so` 的 MNN SDK。
+SDK 内编译会将非系统路径的 `libMNN.so*` 安装至 `output/staging/lib/`。
+
+```bash
+MNN_ROOT=/path/to/mnn-sdk mm -DUSE_MNN_BACKEND=ON
+```
+
+`MNN_ROOT` 也可以通过 CMake 参数 `-DMNN_ROOT=/path/to/mnn-sdk` 设置。
 
 **K3 板卡端**：
 
@@ -191,7 +201,7 @@ scripts/test/robot-test run  components/model_zoo/rl --scope scheduled # 真模�
 
 | 接口名称 | 参数 / 返回 | 功能说明 |
 | :--- | :--- | :--- |
-| `Init` | `const PolicyExecutorConfig &cfg` | 加载 ONNX，建立并严格校验全部 named tensor binding |
+| `Init` | `const PolicyExecutorConfig &cfg` | 加载 ONNX 或 MNN 模型，建立并严格校验全部 named tensor binding |
 | `ObsDim` | `void → int` | 返回预期观测向量维度 |
 | `ActionDim` | `void → int` | 返回动作向量维度 |
 | `FeedbackStateCount` | `void → int` | 自动回灌的 feedback 张量对数量 |
@@ -209,7 +219,7 @@ scripts/test/robot-test run  components/model_zoo/rl --scope scheduled # 真模�
 #### 核心数据结构
 
 **`PolicyExecutorConfig`** — 策略执行参数：
-- 模型路径、动作映射（scale、blend、default_pos）
+- 推理后端、模型路径、动作映射（scale、blend、default_pos）
 - 完整 `model_io` 输入输出绑定、可选 observation/action clip
 - 段式观测配置（terms、mode、length、order、include_current）
 - 观测归一化参数（ang_vel_scale、dof_pos_scale 等）
@@ -257,16 +267,19 @@ policy.MapActionToTargetPos(action, target_pos);
 
 #### 推理后端选择
 
-每个策略可通过 `rl_policy.onnx_infer.policies.<name>.runtime.provider` 选择后端：
+每个策略通过 `backend` 选择模型引擎，默认为 `onnx`：
 
 ```yaml
+backend: onnx
 runtime:
   provider: cpu
 ```
 
-可选值为 `auto`、`cpu`、`spacemit`，默认 `auto`。`auto` 在 RISC-V 上优先启用
-SpaceMIT EP，其他架构使用 CPU；`cpu` 不注册 EP。benchmark 的 `--provider`
-参数独立选择测试后端，默认仍为 `auto`。
+`backend: onnx` 使用 ONNX Runtime，`runtime.provider` 可选 `auto`、`cpu`、
+`spacemit`。`auto` 在 RISC-V 上优先启用 SpaceMIT EP，其他架构使用 CPU。
+`backend: mnn` 需使用 `.mnn` 模型，并在编译时启用 `USE_MNN_BACKEND`、配置 `MNN_ROOT`，其
+`runtime.provider` 仅支持 `auto` 或 `cpu`。benchmark 的 `--provider` 参数仍只针对
+ONNX backend。
 
 #### 观测历史模式说明
 
@@ -278,7 +291,7 @@ SpaceMIT EP，其他架构使用 CPU；`cpu` 不注册 EP。benchmark 的 `--pro
 
 #### 模型 I/O 绑定
 
-每个策略必须显式声明所有 ONNX 输入输出。以下配置同时演示 feedback、constant、external、expose 和 ignore：
+每个策略必须显式声明模型的所有输入输出。以下配置同时演示 feedback、constant、external、expose 和 ignore：
 
 ```yaml
 model_io:
@@ -297,7 +310,7 @@ clip_actions: 100
 
 `observation` 可用 `offset` 把完整观测切给多个输入；`observation_history` 用 `history_of` 指定要跟踪的 `observation` 输入，不跟踪 feedback、constant 或 external。`feedback` 初始为零，之后每帧自动回灌。feedback 输入输出允许 shape 不同，但必须具有相同 dtype 和元素数，复制时按扁平连续缓冲区重解释。`external` 无 `default` 时，首次 `Infer` 前必须由上层调用 `SetModelInput`。绑定缺失、重复绑定，以及自动 float 语义路径不支持的 dtype 会在 `Init` 失败；`external` 的原生 dtype 和元素数在 `SetModelInput` 时校验。
 
-当前部署 ABI 固定为 batch=1，并要求恰好一个确定性关节位置 action 输出。模型中的符号维度会在初始化时固定为 1，不支持运行时改变 shape；明确声明为静态 batch>1 的 observation/action 会初始化失败。ONNX backend 由 `Ort::Value` 按模型声明持有原生 dtype；observation/action 可继续使用 float 便捷视图，`external` / `expose` 可通过 `TensorView` 保留 INT64 等真实类型和精度。FP8/INT4 支持原始 packed buffer，不提供无量化参数的 float 自动转换。`external` / `expose` 不替代 observation term；随机策略、多 action head 或力矩 action 需要增加对应的可复用输出语义，或在导出 ONNX 时封装成该 ABI。
+当前部署 ABI 固定为 batch=1，并要求恰好一个确定性关节位置 action 输出。模型中的符号维度会在初始化时固定为 1，不支持运行时改变 shape；明确声明为静态 batch>1 的 observation/action 会初始化失败。ONNX 和 MNN backend 都按模型声明保留原生 dtype；observation/action 可继续使用 float 便捷视图，`external` / `expose` 可通过 `TensorView` 保留 INT64 等真实类型和精度。ONNX 的 FP8/INT4 支持原始 packed buffer，不提供无量化参数的 float 自动转换。`external` / `expose` 不替代 observation term；随机策略、多 action head 或力矩 action 需要增加对应的可复用输出语义，或在导出模型时封装成该 ABI。
 
 #### 注意事项
 
