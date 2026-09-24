@@ -255,18 +255,26 @@ std::vector<double> target_pos;
 policy.MapActionToTargetPos(action, target_pos);
 ```
 
-#### 推理后端选择
+#### 推理后端与运行参数
 
 每个策略可通过 `rl_policy.onnx_infer.policies.<name>.runtime.provider` 选择后端：
 
 ```yaml
 runtime:
-  provider: cpu
+  provider: auto
+  # threads: 2
+  # warmup_runs: 1
 ```
 
 可选值为 `auto`、`cpu`、`spacemit`，默认 `auto`。`auto` 在 RISC-V 上优先启用
 SpaceMIT EP，其他架构使用 CPU；`cpu` 不注册 EP。benchmark 的 `--provider`
-参数独立选择测试后端，默认仍为 `auto`。
+参数独立选择测试后端，默认仍为 `auto`。可选的 `threads` 必须为正整数，默认 `1`；
+CPU 后端用作 ONNX Runtime intra-op 线程数，SpaceMIT EP 用作请求线程数。
+此参数不负责 CPU 绑核，线程亲和性由调用方配置。多线程是否有益，应在实际负载下
+测量，不能只依据模型单次推理基准。
+
+`warmup_runs` 默认 `0`。启用时，策略接管前按配置的输入初值运行指定次数，以初始化
+后端缓存；预热结果不更新 feedback、动作或观测历史。若模型不接受初始输入，不应启用。
 
 #### 观测历史模式说明
 
