@@ -235,6 +235,15 @@ int main(int argc, char *argv[]) {
                 InputKey(binding),
                 binding.initial_value.data(),
                 static_cast<int>(binding.initial_value.size()));
+            if (loaded_cfg.exec_cfg.backend == "mnn") {
+                auto native_input = rl_policy::MakeTensorView(
+                    binding.initial_value.data(), binding.initial_value.size());
+                policy.SetModelInput(InputKey(binding), native_input);
+                native_input.element_type = rl_policy::TensorElementType::INT32;
+                RequireThrows(
+                    [&] { policy.SetModelInput(InputKey(binding), native_input); },
+                    "原生 external 输入 dtype 不匹配");
+            }
         }
         for (const auto &binding : loaded_cfg.exec_cfg.model_io.outputs) {
             if (binding.target != ModelOutputTarget::EXPOSE) continue;

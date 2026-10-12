@@ -22,6 +22,7 @@ rl_policy:
       # 策略 1：motion — 单段观测（无历史）
       # ----------------------------------------------------------
       motion:
+        backend: "onnx"  # onnx（默认）或 mnn；mnn 模型需配套 .mnn model_path
         model_path: "policy/motion/motion.onnx"  # 相对于 robot_dir
         model_io:
           inputs:
