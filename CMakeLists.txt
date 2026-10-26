@@ -34,25 +34,7 @@ include(cmake/FindONNXRuntime.cmake)
 option(USE_MNN_BACKEND "Enable MNN inference backend" OFF)
 set(MNN_FOUND FALSE)
 if(USE_MNN_BACKEND)
-    if(NOT DEFINED MNN_ROOT AND DEFINED ENV{MNN_ROOT})
-        set(MNN_ROOT "$ENV{MNN_ROOT}")
-    endif()
-    if(MNN_ROOT)
-        unset(MNN_LIB CACHE)
-        unset(MNN_INCLUDE_DIR CACHE)
-        find_library(MNN_LIB NAMES MNN PATHS "${MNN_ROOT}/lib" NO_DEFAULT_PATH)
-        find_path(MNN_INCLUDE_DIR NAMES MNN/Interpreter.hpp
-            PATHS "${MNN_ROOT}/include" NO_DEFAULT_PATH)
-        if(MNN_LIB AND MNN_INCLUDE_DIR)
-            set(MNN_FOUND TRUE)
-        endif()
-    endif()
-    if(NOT MNN_FOUND)
-        message(FATAL_ERROR
-            "USE_MNN_BACKEND=ON requires MNN headers and library. "
-            "MNN_ROOT='${MNN_ROOT}'; expected include/MNN/Interpreter.hpp "
-            "and lib/libMNN.so under MNN_ROOT.")
-    endif()
+    include(cmake/FindMNN.cmake)
 endif()
 
 option(BUILD_EXAMPLES "Build example programs" ON)

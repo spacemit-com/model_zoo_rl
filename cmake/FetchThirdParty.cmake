@@ -102,14 +102,24 @@ function(fetch_thirdparty)
 
       message(STATUS "Fetching ${ARG_NAME}: git clone ${ARG_GIT_REPO}")
       if(ARG_GIT_COMMIT)
-        execute_process(
-          COMMAND git clone --depth 1 ${_recursive_flag} "${ARG_GIT_REPO}" "${_dir}"
-          WORKING_DIRECTORY "${_FETCH_TP_CACHE_ROOT}"
-          RESULT_VARIABLE _res)
+        # 按指定 SHA 浅拉该 commit：init + fetch <sha> + checkout FETCH_HEAD。
+        execute_process(COMMAND git init -q "${_dir}"
+                        WORKING_DIRECTORY "${_FETCH_TP_CACHE_ROOT}" RESULT_VARIABLE _res)
         if(_res EQUAL 0)
-          execute_process(COMMAND git checkout "${ARG_GIT_COMMIT}"
-                          WORKING_DIRECTORY "${_dir}"
-                          RESULT_VARIABLE _res)
+          execute_process(COMMAND git remote add origin "${ARG_GIT_REPO}"
+                          WORKING_DIRECTORY "${_dir}" RESULT_VARIABLE _res)
+        endif()
+        if(_res EQUAL 0)
+          execute_process(COMMAND git fetch --depth 1 origin "${ARG_GIT_COMMIT}"
+                          WORKING_DIRECTORY "${_dir}" RESULT_VARIABLE _res)
+        endif()
+        if(_res EQUAL 0)
+          execute_process(COMMAND git checkout -q FETCH_HEAD
+                          WORKING_DIRECTORY "${_dir}" RESULT_VARIABLE _res)
+        endif()
+        if(_res EQUAL 0 AND ARG_GIT_RECURSIVE)
+          execute_process(COMMAND git submodule update --init --recursive --depth 1
+                          WORKING_DIRECTORY "${_dir}" RESULT_VARIABLE _res)
         endif()
       elseif(ARG_GIT_REF)
         execute_process(

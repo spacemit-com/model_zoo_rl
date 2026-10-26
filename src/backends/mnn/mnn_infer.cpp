@@ -191,6 +191,9 @@ bool MnnRuntimeClass::Init(const std::string &model_file, const RuntimeOptions &
             imp_->input_tensors.push_back(tensor);
             imp_->host_input_tensors.push_back(
                 std::make_unique<MNN::Tensor>(tensor, MNN::Tensor::CAFFE));
+            // Warmup and feedback inputs without a seed must start at zero.
+            auto *host = imp_->host_input_tensors.back().get();
+            std::memset(host->host<void>(), 0, host->size());
         }
 
         // 处理输出张量
