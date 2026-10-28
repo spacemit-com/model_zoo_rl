@@ -624,7 +624,7 @@ PolicyExecutor::Impl::InputCompilation PolicyExecutor::Impl::CompileModelInputs(
             break;
         }
 
-        // ONNX backend 已按原生 dtype 将输入清零。空初值的 feedback 直接复用该
+        // 推理 backend 已按原生 dtype 将输入清零。空初值的 feedback 直接复用该
         // 缓冲区，避免 FP8/INT4 等无 float 自动转换路径的状态张量初始化失败。
         if (!binding.initial_value.empty() &&
             (binding.source == ModelInputSource::FEEDBACK ||
