@@ -30,8 +30,8 @@ find_package(Eigen3 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 include(cmake/FindONNXRuntime.cmake)
 
-# MNN is optional so existing ONNX-only builds keep the original dependency set.
-option(USE_MNN_BACKEND "Enable MNN inference backend" OFF)
+# Build both model backends by default; ONNX-only builds may disable MNN.
+option(USE_MNN_BACKEND "Enable MNN inference backend" ON)
 set(MNN_FOUND FALSE)
 if(USE_MNN_BACKEND)
     include(cmake/FindMNN.cmake)

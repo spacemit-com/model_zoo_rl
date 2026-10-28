@@ -47,13 +47,16 @@ ONNX Runtime 由 CMake 处理。CMake 按以下顺序查找，命中即用：
 > `export ONNXRUNTIME_DIR=/path/to/onnxruntime` 指向预先下载好的目录。其他版本（≥ 1.17）见
 > [github.com/microsoft/onnxruntime/releases](https://github.com/microsoft/onnxruntime/releases)。
 
-MNN 后端默认关闭，使用时通过 `USE_MNN_BACKEND=ON` 开启。
+MNN 后端默认开启，普通构建同时包含 ONNX 和 MNN 推理能力。
 `cmake/FindMNN.cmake` 优先查找 `MNN_ROOT` 指定的 SDK，其次查找本机系统安装，
 然后复用 `~/.cache/thirdparty/mnn/` 中的构建产物。缺失时自动下载固定版本源码并编译。
 
 ```bash
-mm -DUSE_MNN_BACKEND=ON
+mm
 ```
+
+仅需 ONNX 时，可执行 `mm -DUSE_MNN_BACKEND=OFF` 关闭 MNN。
+已有构建目录保留显式设置过的开关值；恢复 MNN 使用 `mm -DUSE_MNN_BACKEND=ON`。
 
 自动构建使用 MNN 3.6.1，固定提交 `bef71b9756a2c77549eddbe33eb97290e3b16602`，
 支持 Linux x86_64 和 riscv64；源码由两种架构共享，编译结果按架构、工具链和选项分目录缓存。
@@ -289,8 +292,8 @@ runtime:
 
 `backend: onnx` 使用 ONNX Runtime，`runtime.provider` 可选 `auto`、`cpu`、
 `spacemit`，默认 `auto`。`auto` 在 RISC-V 上优先启用 SpaceMIT EP，其他架构使用 CPU；
-`cpu` 不注册 EP。`backend: mnn` 需使用 `.mnn` 模型，并在编译时启用
-`USE_MNN_BACKEND`；依赖自动获取，也可用 `MNN_ROOT` 指定，其 `runtime.provider` 仅支持 `auto` 或 `cpu`。
+`cpu` 不注册 EP。`backend: mnn` 使用 `.mnn` 模型，默认构建已包含 MNN 后端；
+依赖自动获取，也可用 `MNN_ROOT` 指定，其 `runtime.provider` 仅支持 `auto` 或 `cpu`。
 benchmark 的 `--provider` 参数仍只针对 ONNX backend，默认 `auto`。
 可选的 `threads` 必须为正整数，默认 `1`；ONNX CPU 后端用作 intra-op 线程数，
 SpaceMIT EP 用作请求线程数，MNN CPU 后端用作推理线程数。
