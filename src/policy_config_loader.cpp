@@ -111,6 +111,10 @@ LoadedPolicyConfig LoadPolicyConfigFromYaml(const std::string &yaml_path,
             NodeAs(runtime["threads"], out.exec_cfg.runtime.threads);
         out.exec_cfg.runtime.warmup_runs =
             NodeAs(runtime["warmup_runs"], out.exec_cfg.runtime.warmup_runs);
+        out.exec_cfg.runtime.ort_spinning =
+            NodeAs(runtime["ort_spinning"], out.exec_cfg.runtime.ort_spinning);
+        out.exec_cfg.runtime.affinity =
+            NodeAs(runtime["affinity"], out.exec_cfg.runtime.affinity);
         const auto &provider = out.exec_cfg.runtime.provider;
         if (provider != "auto" && provider != "cpu" && provider != "spacemit") {
             throw std::runtime_error(

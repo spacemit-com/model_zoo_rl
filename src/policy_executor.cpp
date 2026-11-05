@@ -68,6 +68,7 @@ public:
             const std::string &backend);
     bool Run();
     void RequestTerminate();
+    void ClearTerminate();
     const std::string &GetLastError() const;
     const onnx_runtime::RuntimeInfo &GetRuntimeInfo() const;
     int GetInputCount() const;
@@ -151,6 +152,16 @@ void PolicyModelRuntime::RequestTerminate() {
     }
 #endif
     onnx_.RequestTerminate();
+}
+
+void PolicyModelRuntime::ClearTerminate() {
+#ifdef USE_MNN_BACKEND
+    if (use_mnn_) {
+        mnn_.ClearTerminate();
+        return;
+    }
+#endif
+    onnx_.ClearTerminate();
 }
 
 const std::string &PolicyModelRuntime::GetLastError() const {
@@ -837,6 +848,7 @@ InferenceRuntimeInfo PolicyExecutor::GetRuntimeInfo() const {
     info.affinity = runtime.affinity;
     info.provider_status = runtime.provider_status;
     info.ort_spinning = runtime.ort_spinning;
+    info.worker_threads = runtime.worker_threads;
     return info;
 }
 void PolicyExecutor::PrintModelInfo() const {
@@ -1236,6 +1248,10 @@ void PolicyExecutor::Infer(const Eigen::VectorXf &obs,
 
 void PolicyExecutor::RequestInferenceTermination() {
     impl_->onnx.RequestTerminate();
+}
+
+void PolicyExecutor::ClearInferenceTermination() {
+    impl_->onnx.ClearTerminate();
 }
 
 // ============================================================

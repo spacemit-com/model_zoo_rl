@@ -288,6 +288,8 @@ runtime:
   provider: auto
   # threads: 2
   # warmup_runs: 1
+  # ort_spinning: false
+  # affinity: "0,3,4"
 ```
 
 `backend: onnx` 使用 ONNX Runtime，`runtime.provider` 可选 `auto`、`cpu`、
@@ -297,8 +299,13 @@ runtime:
 benchmark 的 `--provider` 参数仍只针对 ONNX backend，默认 `auto`。
 可选的 `threads` 必须为正整数，默认 `1`；ONNX CPU 后端用作 intra-op 线程数，
 SpaceMIT EP 用作请求线程数，MNN CPU 后端用作推理线程数。
-此参数不负责 CPU 绑核，线程亲和性由调用方配置。多线程是否有益，应在实际负载下
-测量，不能只依据模型单次推理基准。
+`threads` 本身不绑核。ONNX CPU 后端的 worker 默认继承创建会话那个线程的 CPU 集合和
+调度策略；`affinity` 可按 Linux CPU 编号（从 0 开始）另行指定：一组（如 `"0,3,4"`、`"3-4"`）
+由全部 worker 共用，或给 `threads-1` 组逐个指定，调用推理的线程仍由调用方配置。
+SpaceMIT EP 则把 `affinity` 原样作为 EP 线程列表（如 `"0;1"`）。`ort_spinning`
+默认 `true`，worker 在两次推理之间忙等；与控制、通信线程共用 CPU 时应设为 `false`。
+会话创建后，日志输出新起线程的实际 CPU 与调度（`worker threads=tid@cpus/policy`）。
+多线程是否有益，应在实际负载下测量，不能只依据模型单次推理基准。
 
 `warmup_runs` 默认 `0`。启用时，策略接管前按配置的输入初值运行指定次数，以初始化
 后端缓存；预热结果不更新 feedback、动作或观测历史。若模型不接受初始输入，不应启用。

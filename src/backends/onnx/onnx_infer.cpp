@@ -9,17 +9,24 @@
 #include "onnx_infer.h"
 
 #include <onnxruntime_cxx_api.h>
+#include <sched.h>
 
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT(build/c++17)
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -327,6 +334,120 @@ void ZeroTensor(Ort::Value &tensor, const TensorInfo &info) {
     }
 }
 
+// CPU provider: one group applies to every worker; otherwise one group per
+// worker (threads - 1, the caller thread is managed by the application).
+// Groups use Linux CPU numbers like robot_base thread settings; ONNX Runtime
+// numbers logical processors from 1, so each id is shifted by one.
+std::string CpuWorkerAffinity(const std::string &affinity, int threads,
+    std::set<int> *cpus) {
+    if (affinity.empty() || threads <= 1) return {};
+    const auto split = [](const std::string &text, char separator) {
+        std::vector<std::string> parts;
+        std::size_t begin = 0;
+        while (true) {
+            const std::size_t end = text.find(separator, begin);
+            parts.push_back(text.substr(begin, end - begin));
+            if (end == std::string::npos) return parts;
+            begin = end + 1;
+        }
+    };
+    const auto parse_cpu = [&affinity](const std::string &text) {
+        if (text.empty() || text.size() > 4 ||
+            text.find_first_not_of("0123456789") != std::string::npos) {
+            throw std::runtime_error("invalid runtime.affinity: " + affinity);
+        }
+        const int cpu = std::stoi(text);
+        if (cpu >= CPU_SETSIZE) throw std::runtime_error("invalid runtime.affinity: " + affinity);
+        return cpu;
+    };
+    std::vector<std::string> groups;
+    for (const auto &group : split(affinity, ';')) {
+        std::string converted;
+        for (const auto &item : split(group, ',')) {
+            const auto range = split(item, '-');
+            if (range.size() > 2) throw std::runtime_error("invalid runtime.affinity: " + affinity);
+            const int first = parse_cpu(range.front());
+            const int last = parse_cpu(range.back());
+            if (last < first) throw std::runtime_error("invalid runtime.affinity: " + affinity);
+            for (int cpu = first; cpu <= last; ++cpu) cpus->insert(cpu);
+            if (!converted.empty()) converted += ',';
+            converted += std::to_string(first + 1);
+            if (range.size() == 2) converted += '-' + std::to_string(last + 1);
+        }
+        groups.push_back(converted);
+    }
+    const std::size_t workers = static_cast<std::size_t>(threads - 1);
+    if (groups.size() == 1) groups.assign(workers, groups.front());
+    if (groups.size() != workers) {
+        throw std::runtime_error("runtime.affinity needs one group or threads-1 groups for "
+            "the CPU provider: " + affinity);
+    }
+    std::string result;
+    for (std::size_t i = 0; i < groups.size(); ++i) {
+        if (i) result += ';';
+        result += groups[i];
+    }
+    return result;
+}
+
+std::set<int> ProcessThreadIds() {
+    std::set<int> threads;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it("/proc/self/task", error), end;
+        !error && it != end; it.increment(error)) {
+        threads.insert(std::atoi(it->path().filename().c_str()));
+    }
+    return threads;
+}
+
+bool ThreadCpus(int tid, cpu_set_t *cpus) {
+    CPU_ZERO(cpus);
+    return sched_getaffinity(tid, sizeof(*cpus), cpus) == 0;
+}
+
+// "tid@cpus/policy" for threads that did not exist before session creation.
+// ONNX Runtime workers move to configured CPUs once they start running, so
+// wait briefly for them before reporting.
+std::string DescribeNewThreads(const std::set<int> &before, const std::set<int> &requested) {
+    std::vector<int> threads;
+    for (const int tid : ProcessThreadIds()) {
+        if (!before.count(tid)) threads.push_back(tid);
+    }
+    const auto settled = [&threads, &requested]() {
+        for (const int tid : threads) {
+            cpu_set_t cpus;
+            if (!ThreadCpus(tid, &cpus)) continue;
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+                if (CPU_ISSET(cpu, &cpus) && !requested.count(cpu)) return false;
+            }
+        }
+        return true;
+    };
+    if (!requested.empty()) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (!settled() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    std::ostringstream text;
+    for (const int tid : threads) {
+        cpu_set_t cpus;
+        if (!ThreadCpus(tid, &cpus)) continue;
+        std::string list;
+        for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+            if (!CPU_ISSET(cpu, &cpus)) continue;
+            if (!list.empty()) list += ',';
+            list += std::to_string(cpu);
+        }
+        const int policy = sched_getscheduler(tid);
+        const char *name = policy == SCHED_FIFO ? "fifo" : policy == SCHED_RR ? "rr" :
+            policy == SCHED_BATCH ? "batch" : policy == SCHED_IDLE ? "idle" : "other";
+        if (text.tellp() > 0) text << ' ';
+        text << tid << '@' << list << '/' << name;
+    }
+    return text.str();
+}
+
 }  // namespace
 
 class OnnxRuntimeClass::ImpClass {
@@ -336,6 +457,7 @@ public:
     bool Init(const std::string &model_file, const RuntimeOptions &options);
     bool Step();
     void RequestTerminate();
+    void ClearTerminate();
 
     OnnxRuntimeClass &omp;
     Ort::Env env;
@@ -387,6 +509,18 @@ bool OnnxRuntimeClass::ImpClass::Init(
             return value;
         };
         auto next_options = make_options();
+        // Only CPU sessions interpret affinity as worker CPU groups; the EP
+        // receives the configured string unchanged.
+        std::set<int> affinity_cpus;
+        bool cpu_affinity_applied = false;
+        const auto apply_cpu_affinity = [&](Ort::SessionOptions &value) {
+            const std::string cpu_affinity =
+                CpuWorkerAffinity(options.affinity, options.threads, &affinity_cpus);
+            if (!cpu_affinity.empty()) {
+                value.AddConfigEntry("session.intra_op_thread_affinities", cpu_affinity.c_str());
+                cpu_affinity_applied = true;
+            }
+        };
 
         bool request_spacemit = options.provider == "spacemit";
 #if defined(cpu_rv64) || defined(__riscv)
@@ -419,10 +553,17 @@ bool OnnxRuntimeClass::ImpClass::Init(
                     << error << std::endl;
                 next_options = make_options();
                 next_options->SetIntraOpNumThreads(options.threads);
+                std::string affinity_note;
+                try {
+                    apply_cpu_affinity(*next_options);
+                } catch (const std::exception &affinity_error) {
+                    affinity_cpus.clear();
+                    affinity_note = std::string("; CPU worker affinity ignored: ") + affinity_error.what();
+                }
                 omp.runtime_info_.initialized_provider = "cpu";
                 omp.runtime_info_.ort_intra_threads = options.threads;
                 omp.runtime_info_.provider_status =
-                    "SpaceMIT EP init failed; auto fallback to CPU: " + error;
+                    "SpaceMIT EP init failed; auto fallback to CPU: " + error + affinity_note;
             } else {
                 omp.runtime_info_.initialized_provider = "spacemit-registered";
                 omp.runtime_info_.ort_intra_threads = 1;
@@ -436,6 +577,7 @@ bool OnnxRuntimeClass::ImpClass::Init(
 #endif
         } else {
             next_options->SetIntraOpNumThreads(options.threads);
+            apply_cpu_affinity(*next_options);
             omp.runtime_info_.initialized_provider = "cpu";
             omp.runtime_info_.ort_intra_threads = options.threads;
             omp.runtime_info_.provider_status = "CPU provider selected";
@@ -449,14 +591,19 @@ bool OnnxRuntimeClass::ImpClass::Init(
             << ", EP threads requested=" << omp.runtime_info_.ep_threads
             << ", ORT spinning="
             << (omp.runtime_info_.ort_spinning ? "on" : "off")
-            << ", EP affinity requested="
+            << ", affinity requested="
             << (omp.runtime_info_.affinity.empty()
                     ? "not-set" : omp.runtime_info_.affinity)
             << std::endl;
 
+        const auto threads_before = ProcessThreadIds();
         auto next_session =
             std::make_unique<Ort::Session>(env, model_file.c_str(), *next_options);
-        std::cout << "[ONNX Runtime] 模型加载成功" << std::endl;
+        omp.runtime_info_.worker_threads = DescribeNewThreads(threads_before,
+            cpu_affinity_applied ? affinity_cpus : std::set<int>{});
+        std::cout << "[ONNX Runtime] 模型加载成功, worker threads="
+            << (omp.runtime_info_.worker_threads.empty() ? "none" : omp.runtime_info_.worker_threads)
+            << std::endl;
 
         const std::size_t input_count = next_session->GetInputCount();
         std::cout << "[ONNX Runtime] 检测到 " << input_count << " 个输入" << std::endl;
@@ -597,6 +744,10 @@ void OnnxRuntimeClass::ImpClass::RequestTerminate() {
     run_options.SetTerminate();
 }
 
+void OnnxRuntimeClass::ImpClass::ClearTerminate() {
+    run_options.UnsetTerminate();
+}
+
 OnnxRuntimeClass::OnnxRuntimeClass() : imp_(std::make_unique<ImpClass>(this)) {
     std::cout << "[ONNX Runtime] OnnxRuntimeClass 构造" << std::endl;
 }
@@ -631,6 +782,10 @@ bool OnnxRuntimeClass::Run() {
 
 void OnnxRuntimeClass::RequestTerminate() {
     if (imp_) imp_->RequestTerminate();
+}
+
+void OnnxRuntimeClass::ClearTerminate() {
+    if (imp_) imp_->ClearTerminate();
 }
 
 const std::string &OnnxRuntimeClass::GetLastError() const {

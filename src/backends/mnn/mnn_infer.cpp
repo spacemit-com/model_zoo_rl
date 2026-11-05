@@ -286,6 +286,10 @@ bool MnnRuntimeClass::Run() {
     }
 }
 
+void MnnRuntimeClass::ClearTerminate() {
+    terminate_requested_.store(false, std::memory_order_release);
+}
+
 void MnnRuntimeClass::RequestTerminate() {
     terminate_requested_.store(true, std::memory_order_release);
 }
