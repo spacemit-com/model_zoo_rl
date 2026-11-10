@@ -183,6 +183,8 @@ struct InferenceRuntimeConfig {
     /// intra-op worker 亲和性，CPU 编号从 0 开始：一组（如 "0,3,4" 或 "3-4"）
     /// 由全部 worker 共用，或给 threads-1 组逐个 worker 指定。调用推理的线程不受影响。
     std::string affinity;
+    std::string worker_sched;       ///< ONNX CPU workers: empty inherits, or other|fifo|rr
+    int worker_priority = 0;        ///< FIFO/RR priority; caller scheduling is unchanged
     bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
     std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
     bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin
@@ -198,7 +200,7 @@ struct InferenceRuntimeInfo {
     std::string affinity;           ///< 请求的线程亲和性，不代表实际线程落核
     std::string provider_status;
     bool ort_spinning = true;
-    /// 会话创建期间新起的线程：tid@CPU 列表/调度策略（仅 Linux ONNX 后端）
+    /// 会话创建期间新起的线程：tid@CPU 列表/调度策略/优先级（仅 Linux ONNX 后端）
     std::string worker_threads;
 };
 

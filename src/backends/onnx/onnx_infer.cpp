@@ -9,9 +9,11 @@
 #include "onnx_infer.h"
 
 #include <onnxruntime_cxx_api.h>
+#include <pthread.h>
 #include <sched.h>
 
 #include <array>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
@@ -405,7 +407,7 @@ bool ThreadCpus(int tid, cpu_set_t *cpus) {
     return sched_getaffinity(tid, sizeof(*cpus), cpus) == 0;
 }
 
-// "tid@cpus/policy" for threads that did not exist before session creation.
+// "tid@cpus/policy/priority" for threads that did not exist before session creation.
 // ONNX Runtime workers move to configured CPUs once they start running, so
 // wait briefly for them before reporting.
 std::string DescribeNewThreads(const std::set<int> &before, const std::set<int> &requested) {
@@ -443,9 +445,83 @@ std::string DescribeNewThreads(const std::set<int> &before, const std::set<int> 
         const char *name = policy == SCHED_FIFO ? "fifo" : policy == SCHED_RR ? "rr" :
             policy == SCHED_BATCH ? "batch" : policy == SCHED_IDLE ? "idle" : "other";
         if (text.tellp() > 0) text << ' ';
-        text << tid << '@' << list << '/' << name;
+        sched_param param{};
+        const int result = sched_getparam(tid, &param);
+        text << tid << '@' << list << '/' << name << '/'
+            << (result == 0 ? std::to_string(param.sched_priority) : "unknown");
     }
     return text.str();
+}
+
+struct WorkerScheduling {
+    int policy = SCHED_OTHER;
+    int priority = 0;
+};
+
+WorkerScheduling ParseWorkerScheduling(const RuntimeOptions &options) {
+    WorkerScheduling result;
+    if (options.worker_sched == "fifo") result.policy = SCHED_FIFO;
+    else if (options.worker_sched == "rr") result.policy = SCHED_RR;
+    else if (!options.worker_sched.empty() && options.worker_sched != "other")
+        throw std::runtime_error("runtime.worker_sched must be other, fifo, rr or empty");
+    result.priority = options.worker_priority;
+    if (result.priority < sched_get_priority_min(result.policy) ||
+        result.priority > sched_get_priority_max(result.policy))
+        throw std::runtime_error("runtime.worker_priority is invalid for worker_sched");
+    return result;
+}
+
+struct ScheduledWorker {
+    pthread_t thread{};
+    OrtThreadWorkerFn function = nullptr;
+    void *argument = nullptr;
+};
+
+void *RunScheduledWorker(void *argument) {
+    const auto *worker = static_cast<ScheduledWorker *>(argument);
+    pthread_setname_np(pthread_self(), "ort-intra");
+    worker->function(worker->argument);
+    return nullptr;
+}
+
+OrtCustomThreadHandle CreateScheduledWorker(void *options, OrtThreadWorkerFn function,
+    void *argument) {
+    const auto &config = *static_cast<const WorkerScheduling *>(options);
+    auto worker = std::make_unique<ScheduledWorker>();
+    worker->function = function;
+    worker->argument = argument;
+    pthread_attr_t attributes;
+    int error = pthread_attr_init(&attributes);
+    if (error != 0) throw std::runtime_error(std::strerror(error));
+    sched_param param{};
+    param.sched_priority = config.priority;
+    error = pthread_attr_setinheritsched(&attributes, PTHREAD_EXPLICIT_SCHED);
+    if (error == 0) error = pthread_attr_setschedpolicy(&attributes, config.policy);
+    if (error == 0) error = pthread_attr_setschedparam(&attributes, &param);
+    if (error == 0)
+        error = pthread_create(&worker->thread, &attributes, RunScheduledWorker, worker.get());
+    // Preserve unprivileged simulation support, matching application ThreadLoop.
+    // Always report the permission failure and the actual worker scheduling.
+    if (error == EPERM) {
+        std::cerr << "[ONNX Runtime] worker realtime scheduling denied (policy="
+            << config.policy << ", priority=" << config.priority
+            << "); using SCHED_OTHER/0; check RLIMIT_RTPRIO or CAP_SYS_NICE\n";
+        param.sched_priority = 0;
+        error = pthread_attr_setschedpolicy(&attributes, SCHED_OTHER);
+        if (error == 0) error = pthread_attr_setschedparam(&attributes, &param);
+        if (error == 0)
+            error = pthread_create(&worker->thread, &attributes, RunScheduledWorker, worker.get());
+    }
+    pthread_attr_destroy(&attributes);
+    if (error != 0)
+        throw std::runtime_error("ONNX worker creation failed: " + std::string(std::strerror(error)));
+    return reinterpret_cast<OrtCustomThreadHandle>(worker.release());
+}
+
+void JoinScheduledWorker(OrtCustomThreadHandle handle) {
+    const auto *worker = reinterpret_cast<const ScheduledWorker *>(handle);
+    pthread_join(worker->thread, nullptr);
+    delete worker;
 }
 
 }  // namespace
@@ -461,6 +537,7 @@ public:
 
     OnnxRuntimeClass &omp;
     Ort::Env env;
+    WorkerScheduling worker_scheduling;
     std::unique_ptr<Ort::Session> session;
     Ort::RunOptions run_options;
     Ort::AllocatorWithDefaultOptions allocator;
@@ -492,6 +569,7 @@ bool OnnxRuntimeClass::ImpClass::Init(
         if (options.threads <= 0) {
             throw std::runtime_error("threads must be greater than zero");
         }
+        worker_scheduling = ParseWorkerScheduling(options);
 
         omp.runtime_info_ = {};
         omp.runtime_info_.requested_provider = options.provider;
@@ -581,6 +659,14 @@ bool OnnxRuntimeClass::ImpClass::Init(
             omp.runtime_info_.initialized_provider = "cpu";
             omp.runtime_info_.ort_intra_threads = options.threads;
             omp.runtime_info_.provider_status = "CPU provider selected";
+        }
+
+        if (!options.worker_sched.empty()) {
+            if (omp.runtime_info_.initialized_provider != "cpu")
+                throw std::runtime_error("runtime.worker_sched requires the CPU provider");
+            next_options->SetCustomCreateThreadFn(CreateScheduledWorker);
+            next_options->SetCustomThreadCreationOptions(&worker_scheduling);
+            next_options->SetCustomJoinThreadFn(JoinScheduledWorker);
         }
 
         std::cout << "[ONNX Runtime] provider requested="

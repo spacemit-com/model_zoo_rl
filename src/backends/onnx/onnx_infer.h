@@ -73,6 +73,8 @@ struct RuntimeOptions {
     /// intra-op worker 亲和性，CPU 编号从 0 开始：一组（如 "0,3,4" 或 "3-4"）
     /// 由全部 worker 共用，或给 threads-1 组逐个 worker 指定。调用推理的线程不受影响。
     std::string affinity;
+    std::string worker_sched;       ///< CPU workers: empty inherits, or other|fifo|rr
+    int worker_priority = 0;
     bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
     std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
     bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin

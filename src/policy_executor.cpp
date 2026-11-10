@@ -109,7 +109,8 @@ bool PolicyModelRuntime::Init(const std::string &path,
     if (options.provider != "auto" && options.provider != "cpu") {
         throw std::invalid_argument("MNN supports only auto or cpu provider");
     }
-    if (!options.affinity.empty() || options.ep_dump_subgraphs ||
+    if (!options.affinity.empty() || !options.worker_sched.empty() ||
+        options.worker_priority != 0 || options.ep_dump_subgraphs ||
         !options.ep_profile_prefix.empty()) {
         throw std::invalid_argument("MNN does not support ONNX provider options");
     }
@@ -966,6 +967,8 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     runtime_options.provider = cfg.runtime.provider;
     runtime_options.threads = cfg.runtime.threads;
     runtime_options.affinity = cfg.runtime.affinity;
+    runtime_options.worker_sched = cfg.runtime.worker_sched;
+    runtime_options.worker_priority = cfg.runtime.worker_priority;
     runtime_options.ep_dump_subgraphs = cfg.runtime.ep_dump_subgraphs;
     runtime_options.ep_profile_prefix = cfg.runtime.ep_profile_prefix;
     runtime_options.ort_spinning = cfg.runtime.ort_spinning;
