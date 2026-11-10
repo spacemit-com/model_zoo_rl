@@ -69,7 +69,12 @@ struct TensorInfo {
 struct RuntimeOptions {
     std::string provider = "auto";  ///< auto | cpu | spacemit
     int threads = 1;                ///< CPU intra-op 或 SpaceMIT EP 线程数
-    std::string affinity;           ///< SpaceMIT EP CPU 列表，分号分隔，例如 "0;1"
+    /// 推理线程 CPU 列表。SpaceMIT EP 原样透传，例如 "0;1"；CPU provider 设置
+    /// intra-op worker 亲和性，CPU 编号从 0 开始：一组（如 "0,3,4" 或 "3-4"）
+    /// 由全部 worker 共用，或给 threads-1 组逐个 worker 指定。调用推理的线程不受影响。
+    std::string affinity;
+    std::string worker_sched;       ///< CPU workers: empty inherits, or other|fifo|rr
+    int worker_priority = 0;
     bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
     std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
     bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin
@@ -82,9 +87,12 @@ struct RuntimeInfo {
     int ort_intra_threads = 1;
     int ort_inter_threads = 1;
     int ep_threads = 0;             ///< 传给 EP 的请求值，不代表实际并行核数
-    std::string affinity;           ///< 传给 EP 的请求值，不代表实际线程落核
+    std::string affinity;           ///< 请求的线程亲和性，不代表实际线程落核
     std::string provider_status;
     bool ort_spinning = true;
+    /// 会话创建期间新起的线程：tid@CPU 列表/调度策略，以空格分隔（仅 Linux）。
+    /// 同期其他线程创建的线程也会计入。
+    std::string worker_threads;
 };
 
 /**
@@ -118,6 +126,9 @@ public:
 
     /** @brief 请求中断当前使用本实例 RunOptions 执行的推理。 */
     void RequestTerminate();
+
+    /** @brief 撤销 RequestTerminate，让同一会话继续推理 */
+    void ClearTerminate();
 
     /** @return 最近一次初始化或推理失败的错误信息 */
     const std::string &GetLastError() const;

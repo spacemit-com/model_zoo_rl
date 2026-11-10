@@ -105,6 +105,9 @@ public:
     /** @brief 请求中断当前正在执行的推理。再次使用前需重新 Init。 */
     void RequestTerminate();
 
+    /** @brief 撤销 RequestTerminate，让同一会话继续推理 */
+    void ClearTerminate();
+
     /** @return 最近一次初始化或推理失败的错误信息 */
     const std::string &GetLastError() const;
 

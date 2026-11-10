@@ -226,7 +226,8 @@ scripts/test/robot-test run  components/model_zoo/rl --scope scheduled # 真模�
 | `GetModelOutputTensor` | `key → TensorView` | 读取保留原生 dtype 的 `target: expose` 输出 |
 | `AssembleObs` | 传感器数据 → `Eigen::VectorXf &out_obs` | 组装观测向量：计算各段、交给对应处理器、拼接输出 |
 | `Infer` | `const Eigen::VectorXf &obs` → `std::vector<double> &action` | 按声明绑定输入、执行推理、反馈状态并处理输出 |
-| `RequestInferenceTermination` | `void` | 中止当前正在执行的推理；再次使用执行器前必须重新调用 `Init` |
+| `RequestInferenceTermination` | `void` | 请求中止当前推理；调用方仍须等待推理线程退出 |
+| `ClearInferenceTermination` | `void` | 推理线程退出后清除取消状态，复用已初始化模型；不得与 `Infer` 并发调用 |
 | `MapActionToTargetPos` | `const std::vector<double> &action` → `std::vector<double> &target_pos` | 将策略动作映射为全身关节目标位置 |
 
 #### 核心数据结构
@@ -288,6 +289,10 @@ runtime:
   provider: auto
   # threads: 2
   # warmup_runs: 1
+  # ort_spinning: false
+  # affinity: "0,3,4"
+  # worker_sched: fifo
+  # worker_priority: 50
 ```
 
 `backend: onnx` 使用 ONNX Runtime，`runtime.provider` 可选 `auto`、`cpu`、
@@ -297,8 +302,17 @@ runtime:
 benchmark 的 `--provider` 参数仍只针对 ONNX backend，默认 `auto`。
 可选的 `threads` 必须为正整数，默认 `1`；ONNX CPU 后端用作 intra-op 线程数，
 SpaceMIT EP 用作请求线程数，MNN CPU 后端用作推理线程数。
-此参数不负责 CPU 绑核，线程亲和性由调用方配置。多线程是否有益，应在实际负载下
-测量，不能只依据模型单次推理基准。
+`threads` 本身不绑核。ONNX CPU 后端的 worker 默认继承创建会话那个线程的 CPU 集合和
+调度策略；`affinity` 可按 Linux CPU 编号（从 0 开始）另行指定：一组（如 `"0,3,4"`、`"3-4"`）
+由全部 worker 共用，或给 `threads-1` 组逐个指定，调用推理的线程仍由调用方配置。
+SpaceMIT EP 则把 `affinity` 原样作为 EP 线程列表（如 `"0;1"`）。`ort_spinning`
+默认 `true`，worker 在两次推理之间忙等；与控制、通信线程共用 CPU 时应设为 `false`。
+CPU 后端可用 `worker_sched: other|fifo|rr` 和 `worker_priority` 显式设置 worker
+调度，不受后台预加载线程的调度影响；省略时保持继承行为。实时优先级须在操作系统
+允许范围内，权限不足时记录警告并使用 `other/0`，便于非特权仿真。调用方线程仍由
+应用配置；这些 worker 调度选项不适用于 MNN 或 SpaceMIT EP。
+会话创建后，日志输出新起线程的实际 CPU 与调度（`worker threads=tid@cpus/policy/priority`）。
+多线程是否有益，应在实际负载下测量，不能只依据模型单次推理基准。
 
 `warmup_runs` 默认 `0`。启用时，策略接管前按配置的输入初值运行指定次数，以初始化
 后端缓存；预热结果不更新 feedback、动作或观测历史。若模型不接受初始输入，不应启用。
