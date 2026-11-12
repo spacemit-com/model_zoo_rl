@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -77,6 +78,7 @@ struct RuntimeOptions {
     int worker_priority = 0;
     bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
     std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
+    std::map<std::string, std::string> ep_options;
     bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin
 };
 
