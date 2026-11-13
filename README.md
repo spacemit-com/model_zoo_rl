@@ -317,6 +317,10 @@ CPU 后端可用 `worker_sched: other|fifo|rr` 和 `worker_priority` 显式设�
 `warmup_runs` 默认 `0`。启用时，策略接管前按配置的输入初值运行指定次数，以初始化
 后端缓存；预热结果不更新 feedback、动作或观测历史。若模型不接受初始输入，不应启用。
 
+`runtime.ep_options` 可传入 SpaceMIT EP 的字符串键值配置，例如算子过滤或精度选项。
+仅注册 EP 时使用，CPU 会话忽略，MNN 不支持。显式的 `threads`、非空 `affinity`
+以及启用的 dump/profile 设置优先于同名 EP 选项；具体选项由所用 EP 版本解释。
+
 #### 观测历史模式说明
 
 | 模式 | YAML 值 | 说明 | 典型场景 |

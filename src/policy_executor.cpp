@@ -111,7 +111,7 @@ bool PolicyModelRuntime::Init(const std::string &path,
     }
     if (!options.affinity.empty() || !options.worker_sched.empty() ||
         options.worker_priority != 0 || options.ep_dump_subgraphs ||
-        !options.ep_profile_prefix.empty()) {
+        !options.ep_profile_prefix.empty() || !options.ep_options.empty()) {
         throw std::invalid_argument("MNN does not support ONNX provider options");
     }
     mnn_runtime::RuntimeOptions mnn_options;
@@ -971,6 +971,7 @@ void PolicyExecutor::Init(const PolicyExecutorConfig &cfg) {
     runtime_options.worker_priority = cfg.runtime.worker_priority;
     runtime_options.ep_dump_subgraphs = cfg.runtime.ep_dump_subgraphs;
     runtime_options.ep_profile_prefix = cfg.runtime.ep_profile_prefix;
+    runtime_options.ep_options = cfg.runtime.ep_options;
     runtime_options.ort_spinning = cfg.runtime.ort_spinning;
     if (!impl_->onnx.Init(cfg.model_path, runtime_options, cfg.backend)) {
         throw std::runtime_error(

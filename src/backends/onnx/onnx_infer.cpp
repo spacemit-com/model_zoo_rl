@@ -608,9 +608,9 @@ bool OnnxRuntimeClass::ImpClass::Init(
         if (request_spacemit) {
 #if defined(cpu_rv64) || defined(__riscv)
             next_options->SetIntraOpNumThreads(1);
-            std::unordered_map<std::string, std::string> provider_options = {
-                {"SPACEMIT_EP_INTRA_THREAD_NUM", std::to_string(options.threads)},
-            };
+            std::unordered_map<std::string, std::string> provider_options(
+                options.ep_options.begin(), options.ep_options.end());
+            provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(options.threads);
             if (!options.affinity.empty()) {
                 provider_options["SPACEMIT_EP_INTRA_THREAD_AFFINITY"] = options.affinity;
             }

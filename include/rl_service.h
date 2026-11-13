@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -187,6 +188,7 @@ struct InferenceRuntimeConfig {
     int worker_priority = 0;        ///< FIFO/RR priority; caller scheduling is unchanged
     bool ep_dump_subgraphs = false;  ///< 导出 SpaceMIT EP 实际编译子图
     std::string ep_profile_prefix;   ///< 非空时导出 SpaceMIT EP profile JSON
+    std::map<std::string, std::string> ep_options;  ///< SpaceMIT EP options; CPU sessions ignore them
     bool ort_spinning = true;        ///< ONNX Runtime intra-op worker 是否允许 busy-spin
 };
 
