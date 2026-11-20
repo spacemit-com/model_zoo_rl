@@ -415,6 +415,11 @@ int main(int argc, char *argv[]) {
         }
 
         print_report(results);
+        for (const auto &result : results) {
+            if (!result.load_ok || !result.infer_ok) {
+                return 1;
+            }
+        }
         return 0;
     }
 

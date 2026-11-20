@@ -146,9 +146,11 @@ inline double ParseDouble(const char *text, const std::string &name) {
     return value;
 }
 
-inline Options ParseOptions(int argc, char *argv[], int first_option, double default_hz) {
+inline Options ParseOptions(int argc, char *argv[], int first_option, double default_hz,
+                            const std::string &default_provider = "auto") {
     Options options;
     options.hz = default_hz;
+    options.provider = default_provider;
 
     const auto require_value = [&](int index, const std::string &name) {
         if (index + 1 >= argc) {
