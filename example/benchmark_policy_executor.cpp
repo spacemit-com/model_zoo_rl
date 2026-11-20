@@ -166,7 +166,8 @@ int main(int argc, char *argv[]) {
             = rl_policy::LoadPolicyConfigFromYaml(yaml_path, policy_name, robot_dir);
         ValidatePipelineBoundary(loaded);
 
-        const Options options = rl_benchmark::ParseOptions(argc, argv, 4, 1.0 / loaded.rl_dt);
+        const Options options = rl_benchmark::ParseOptions(
+            argc, argv, 4, 1.0 / loaded.rl_dt, loaded.exec_cfg.runtime.provider);
         const double input_dt = options.hz_overridden ? 1.0 / options.hz : loaded.rl_dt;
         const std::string affinity_before_init
             = rl_benchmark::ApplyAndGetAffinity(options.affinity);
